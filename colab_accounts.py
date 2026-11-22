@@ -477,23 +477,96 @@ AMBER = "#f59e0b"
 RED = "#ef4444"
 
 
-def is_gui_running() -> bool:
-    if not GUI_PID_PATH.is_file():
-        return False
+def _find_gui_hwnd(pid: int) -> Optional[int]:
+    """On Windows, return a top-level HWND belonging to `pid` (if any)."""
+    if os.name != "nt" or not pid or pid <= 0:
+        return None
     try:
-        pid = int(GUI_PID_PATH.read_text(encoding="utf-8").strip())
-        return _is_pid_alive(pid)
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+        def _cb(hwnd: int, _lp: int) -> bool:
+            wpid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and user32.IsWindowVisible(hwnd):
+                found.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return found[0] if found else None
     except Exception:
+        return None
+
+
+def _focus_hwnd(hwnd: int) -> None:
+    if os.name != "nt" or not hwnd:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def _read_gui_pid() -> Optional[int]:
+    if not GUI_PID_PATH.is_file():
+        return None
+    try:
+        return int(GUI_PID_PATH.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def is_gui_running(*, cleanup_zombie: bool = False) -> bool:
+    pid = _read_gui_pid()
+    if not pid or not _is_pid_alive(pid):
+        if cleanup_zombie and GUI_PID_PATH.is_file():
+            GUI_PID_PATH.unlink(missing_ok=True)
         return False
+    if os.name == "nt":
+        # A pythonw.exe with no visible window after startup is a zombie; clean it up if requested.
+        if _find_gui_hwnd(pid) is not None:
+            return True
+        # Give a freshly spawned process up to 5 seconds to create its window before treating as zombie.
+        try:
+            age = time.time() - GUI_PID_PATH.stat().st_mtime
+        except OSError:
+            age = 999.0
+        if age < 5.0:
+            return True
+        if cleanup_zombie:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATION_FLAGS,
+                check=False,
+            )
+            GUI_PID_PATH.unlink(missing_ok=True)
+        return False
+    return True
 
 
-def ensure_gui_open(*, tab: str = "monitor") -> bool:
+def ensure_gui_open(*, tab: str = "monitor", focus_if_open: bool = False) -> bool:
     """Spawn the Studio GUI detached (windowless) if not already running. Returns True if launched."""
     if os.environ.get("COLAB_NO_GUI", "").strip().lower() in ("1", "true", "yes"):
         return False
     if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return False
-    if is_gui_running():
+    if is_gui_running(cleanup_zombie=True):
+        if focus_if_open:
+            pid = _read_gui_pid()
+            if pid:
+                hwnd = _find_gui_hwnd(pid)
+                if hwnd:
+                    _focus_hwnd(hwnd)
         return False
 
     py_exe = _find_uv_colab_python(windowless=True) or _find_uv_colab_python(windowless=False)
@@ -512,12 +585,13 @@ def ensure_gui_open(*, tab: str = "monitor") -> bool:
         close_fds=True,
     )
     if os.name == "nt":
-        flags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        kwargs["creationflags"] = flags
+        # Note: Do NOT pass CREATE_NO_WINDOW or DETACHED_PROCESS to pythonw.exe — pythonw is already
+        # a GUI-subsystem binary (no CMD window) and needs SW_SHOWNORMAL to display its Tk window cleanly.
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 1  # SW_SHOWNORMAL
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         kwargs["start_new_session"] = True
     try:
@@ -531,7 +605,12 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    if is_gui_running():
+    if is_gui_running(cleanup_zombie=True):
+        pid = _read_gui_pid()
+        if pid:
+            hwnd = _find_gui_hwnd(pid)
+            if hwnd:
+                _focus_hwnd(hwnd)
         return 0
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     try:
