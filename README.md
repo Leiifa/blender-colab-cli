@@ -110,7 +110,8 @@ Safety guardrails built into the runbooks ensure agents always `--dry-run` Blend
 
 | Command | Description |
 | --- | --- |
-| `python colab_accounts.py` / `Colab_Accounts.bat` | Open the Account Switcher GUI |
+| `python colab_accounts.py` / `Colab_Accounts.bat` | Open the Studio GUI |
+| `python colab_accounts.py monitor` | Open the Studio GUI detached on **Live Monitor** (single-instance, non-blocking; great for agents) |
 | `python colab_accounts.py list [--json]` | List saved accounts with live CU balances and active VMs |
 | `python colab_accounts.py active [--json]` | Show active account email, CU balance, burn rate, and active VMs |
 | `python colab_accounts.py vms [--json]` | List all active Colab VMs across every saved account |
@@ -130,6 +131,7 @@ Safety guardrails built into the runbooks ensure agents always `--dry-run` Blend
 - `--keep` — keep VM running after completion (stop later with `colab_render.py stop`)
 - `--skip-prepare` — upload `.blend` as-is without running `prepare_shot.py`
 - `--dry-run` — check assets & missing frames without allocating a VM
+- `--no-gui` — suppress auto-opening the **Live Monitor** GUI when a render starts (or set `COLAB_NO_GUI=1`)
 - `--extra KEY=VAL` (repeatable) — passed to `cloud_render.py`:
   - `engine=cycles|eevee` — override the `.blend`'s render engine
   - `fmt=png|exr|v7` — `png` (default), `exr` (multilayer 32-bit ZIP), or `v7` (16-bit PNG + `_mist.png` + optional `keepexr`)

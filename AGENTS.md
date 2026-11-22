@@ -25,7 +25,11 @@ python colab_accounts.py stop-vms
 
 ## Workflow A: General GPU Jobs (Non-Blender)
 1. Check `python colab_accounts.py active --json` to confirm Compute Units > 0.
-2. Prefer ephemeral execution so VMs self-terminate even on error:
+2. Open the Live Monitor GUI for the user (detached, single-instance, returns immediately):
+   ```bash
+   python colab_accounts.py monitor
+   ```
+3. Prefer ephemeral execution so VMs self-terminate even on error:
    ```bash
    colab run --gpu L4 my_script.py [args...]
    ```
@@ -51,5 +55,5 @@ python colab_accounts.py stop-vms
    ```bash
    python colab_render.py shot path/to/scene.blend --out renders/shot --f0 1 --f1 1 --samples 48 --gpu L4
    ```
-   Frames stream directly into `--out` as each finishes, existing frames are skipped on resume, and the VM stops automatically on exit.
+   Frames stream directly into `--out` as each finishes, existing frames are skipped on resume, the Studio GUI auto-opens on the **Live Monitor** tab (unless `--no-gui` or `COLAB_NO_GUI=1`), and the VM stops automatically on exit.
 4. **Verify:** check frame count equals `f1 - f0 + 1`, confirm no zero-byte files, and verify `colab sessions` is empty.

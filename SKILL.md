@@ -31,6 +31,7 @@ python colab_accounts.py stop-vms
    ```bash
    python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4
    ```
+   - Auto-opens the Studio GUI on the **Live Monitor** tab (single-instance, detached; disable with `--no-gui` or `COLAB_NO_GUI=1`).
    - Streams each completed frame straight to `<dir>` and deletes it from the VM.
    - Resumable: existing non-empty frames in `<dir>` are skipped automatically.
    - Auto-stops the Colab VM on completion or error unless `--keep` is passed.
@@ -40,6 +41,10 @@ python colab_accounts.py stop-vms
    ```
 
 ## Running General GPU Workloads (Non-Blender)
+- Open the Live Monitor GUI for the user before provisioning a GPU (single-instance, detached, non-blocking):
+  ```bash
+  python colab_accounts.py monitor
+  ```
 - Ephemeral one-shot script (provisions GPU, runs script, auto-stops VM):
   ```bash
   colab run --gpu L4 script.py [args...]

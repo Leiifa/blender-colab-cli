@@ -82,6 +82,7 @@ ACCOUNTS_INDEX_PATH = CONFIG_DIR / "accounts.json"
 SESSIONS_PATH = CONFIG_DIR / "sessions.json"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 JOBS_DIR = CONFIG_DIR / "jobs"
+GUI_PID_PATH = CONFIG_DIR / "gui.pid"
 
 
 # ---------------------------------------------------------------------------
@@ -476,9 +477,67 @@ AMBER = "#f59e0b"
 RED = "#ef4444"
 
 
-def launch_gui() -> int:
+def is_gui_running() -> bool:
+    if not GUI_PID_PATH.is_file():
+        return False
+    try:
+        pid = int(GUI_PID_PATH.read_text(encoding="utf-8").strip())
+        return _is_pid_alive(pid)
+    except Exception:
+        return False
+
+
+def ensure_gui_open(*, tab: str = "monitor") -> bool:
+    """Spawn the Studio GUI detached (windowless) if not already running. Returns True if launched."""
+    if os.environ.get("COLAB_NO_GUI", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    if is_gui_running():
+        return False
+
+    py_exe = _find_uv_colab_python(windowless=True) or _find_uv_colab_python(windowless=False)
+    if not py_exe:
+        exe = Path(sys.executable)
+        if os.name == "nt" and exe.name.lower() == "python.exe" and exe.with_name("pythonw.exe").is_file():
+            py_exe = exe.with_name("pythonw.exe")
+        else:
+            py_exe = exe
+
+    cmd = [str(py_exe), str(Path(__file__).resolve()), "gui", "--tab", tab]
+    kwargs: dict[str, Any] = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if os.name == "nt":
+        flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
+def launch_gui(*, initial_tab: str = "accounts") -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+
+    if is_gui_running():
+        return 0
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        GUI_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
 
     root = tk.Tk()
     root.title("Colab CLI Studio — Accounts, Live Monitor & Blender Render")
@@ -1608,11 +1667,31 @@ def launch_gui() -> int:
 
     tree.bind("<Double-1>", do_switch)
 
+    tab_map = {"accounts": tab_accounts, "monitor": tab_monitor, "render": tab_render}
+    if initial_tab in tab_map:
+        nb.select(tab_map[initial_tab])
+
+    def _cleanup_pid() -> None:
+        try:
+            if GUI_PID_PATH.is_file() and GUI_PID_PATH.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                GUI_PID_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _on_close() -> None:
+        _cleanup_pid()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
     render_accounts_ui()
     root.after(150, lambda: refresh_all(sync_first=True))
     root.after(300, poll_render_monitor)
     root.after(15000, schedule_auto_refresh)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        _cleanup_pid()
     return 0
 
 
@@ -1622,10 +1701,23 @@ def launch_gui() -> int:
 def main(argv: list[str]) -> int:
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
+    initial_tab = "accounts"
+    if "--tab" in argv:
+        ti = argv.index("--tab")
+        if ti + 1 < len(argv):
+            initial_tab = argv[ti + 1].lower()
+            argv = argv[:ti] + argv[ti + 2 :]
     if not argv or argv[0] == "gui":
-        return launch_gui()
+        return launch_gui(initial_tab=initial_tab)
 
     cmd = argv[0].lower()
+    if cmd == "monitor":
+        launched = ensure_gui_open(tab="monitor")
+        if as_json:
+            print(json.dumps({"launched": launched, "running": True}))
+        else:
+            print("Opened Colab CLI Studio on Live Monitor." if launched else "Colab CLI Studio is already open.")
+        return 0
     if cmd == "list":
         sync_current_cli_login()
         idx = _load_index()

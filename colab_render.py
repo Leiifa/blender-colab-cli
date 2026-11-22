@@ -646,6 +646,25 @@ def _run_remote_job(
     return len(downloaded_files), rc
 
 
+def _maybe_open_monitor_gui(no_gui: bool) -> None:
+    """Auto-open Colab CLI Studio on the Live Monitor tab (detached, single-instance, zero-CMD)."""
+    if no_gui or os.environ.get("COLAB_NO_GUI", "").strip().lower() in ("1", "true", "yes"):
+        return
+    if not ACCOUNTS_SCRIPT.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(ACCOUNTS_SCRIPT), "monitor"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATION_FLAGS,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve() if args.project_root else Path.cwd().resolve()
     out_root = Path(args.out_root).resolve() if args.out_root else project_root
@@ -682,6 +701,8 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
         session=args.session,
         par=args.par,
     )
+    if not args.dry_run:
+        _maybe_open_monitor_gui(getattr(args, "no_gui", False))
 
     with tempfile.TemporaryDirectory(prefix="blender_colab_stage_") as tmp_stage:
         stage_root = Path(tmp_stage)
@@ -858,6 +879,7 @@ def _add_render_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stop-existing", action="store_true", help="Also stop the session even if it already existed before this run")
     p.add_argument("--skip-prepare", action="store_true", help="Upload the .blend directly without running prepare_shot.py")
     p.add_argument("--dry-run", action="store_true", help="Check assets and missing frames without allocating a VM")
+    p.add_argument("--no-gui", action="store_true", help="Do not auto-open the Live Monitor GUI when rendering starts")
 
 
 def main() -> int:
