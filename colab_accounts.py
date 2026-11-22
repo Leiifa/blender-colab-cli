@@ -841,6 +841,8 @@ def launch_gui() -> int:
 # CLI subcommands
 # ---------------------------------------------------------------------------
 def main(argv: list[str]) -> int:
+    as_json = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
     if not argv or argv[0] == "gui":
         return launch_gui()
 
@@ -850,33 +852,68 @@ def main(argv: list[str]) -> int:
         idx = _load_index()
         active = idx.get("active")
         accounts = sorted(idx.get("accounts", {}).keys())
-        if not accounts:
-            print("No saved Colab accounts. Run `python colab_accounts.py` to add one.")
-            return 0
+        rows = []
         for em in accounts:
             tok = _get_account_token_json(em)
-            mark = "*" if em == active else " "
             if not tok:
-                print(f"{mark} {em:38s}  [missing keyring token]")
+                rows.append({"email": em, "active": em == active, "error": "missing keyring token"})
                 continue
             try:
                 info = _query_account_live_status(tok)
-                print(
-                    f"{mark} {em:38s}  {info['balance']:7.2f} CU  "
-                    f"({info['rate']:.2f}/hr, {info['assignments_count']} VM)"
+                rows.append(
+                    {
+                        "email": em,
+                        "active": em == active,
+                        "balance": info["balance"],
+                        "rate": info["rate"],
+                        "assignments_count": info["assignments_count"],
+                        "assignments": info["assignments"],
+                    }
                 )
             except Exception as e:
-                print(f"{mark} {em:38s}  [error: {e}]")
+                rows.append({"email": em, "active": em == active, "error": str(e)})
+        if as_json:
+            print(json.dumps({"active": active, "accounts": rows}, indent=2))
+            return 0
+        if not rows:
+            print("No saved Colab accounts. Run `python colab_accounts.py` to add one.")
+            return 0
+        for r in rows:
+            mark = "*" if r["active"] else " "
+            if "error" in r:
+                print(f"{mark} {r['email']:38s}  [error: {r['error']}]")
+            else:
+                print(
+                    f"{mark} {r['email']:38s}  {r['balance']:7.2f} CU  "
+                    f"({r['rate']:.2f}/hr, {r['assignments_count']} VM)"
+                )
         return 0
 
     if cmd == "active":
         em = sync_current_cli_login()
         if not em:
-            print("Not signed in.")
+            if as_json:
+                print(json.dumps({"active": None}))
+            else:
+                print("Not signed in.")
             return 1
         tok = _get_active_token_json()
         assert tok is not None
         info = _query_account_live_status(tok)
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "email": info["email"],
+                        "balance": info["balance"],
+                        "rate": info["rate"],
+                        "assignments_count": info["assignments_count"],
+                        "assignments": info["assignments"],
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         print(f"Active account : {info['email']}")
         print(f"Compute units  : {info['balance']:.2f} CU")
         print(f"Usage rate     : {info['rate']:.2f}/hr")
@@ -887,7 +924,10 @@ def main(argv: list[str]) -> int:
         if len(argv) < 2:
             raise SystemExit("Usage: python colab_accounts.py switch <email>")
         em = switch_active_account(argv[1])
-        print(f"Switched active Colab CLI account to: {em}")
+        if as_json:
+            print(json.dumps({"switched_to": em}))
+        else:
+            print(f"Switched active Colab CLI account to: {em}")
         return 0
 
     if cmd == "stop-vms":
@@ -895,7 +935,10 @@ def main(argv: list[str]) -> int:
         if not em:
             raise SystemExit("No active account.")
         n = stop_all_vms_for_account(em)
-        print(f"Stopped {n} active VM(s) on {em}.")
+        if as_json:
+            print(json.dumps({"email": em, "stopped_vms": n}))
+        else:
+            print(f"Stopped {n} active VM(s) on {em}.")
         return 0
 
     raise SystemExit(f"Unknown command: {cmd}. Expected: gui | list | active | switch <email> | stop-vms [email]")
