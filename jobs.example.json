@@ -1,0 +1,24 @@
+[
+  {
+    "name": "hero_shot_beauty",
+    "blend": "blender/hero_shot.blend",
+    "out": "renders/hero_shot",
+    "prefix": "f_",
+    "f0": 1,
+    "f1": 120,
+    "samples": 64
+  },
+  {
+    "name": "hero_shot_exr_halfres",
+    "blend": "blender/hero_shot.blend",
+    "out": "renders/hero_shot_exr",
+    "prefix": "c_",
+    "f0": 1,
+    "f1": 120,
+    "samples": 96,
+    "extra": [
+      "fmt=exr",
+      "pct=50"
+    ]
+  }
+]

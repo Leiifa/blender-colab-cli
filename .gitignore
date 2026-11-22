@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+_colab_stage/
+renders/
+jobs.json
+*.blend
+*.blend1
+*.zip
+*.part
+.DS_Store
+Thumbs.db
