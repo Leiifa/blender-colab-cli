@@ -56,16 +56,17 @@ BLENDER_VER_RE = re.compile(r"Blender\s+(\d+\.\d+\.\d+)")
 CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 MONITOR_DIR = Path.home() / ".config" / "colab-cli"
-ACTIVE_RENDER_JSON = MONITOR_DIR / "active_render.json"
-ACTIVE_RENDER_LOG = MONITOR_DIR / "active_render.log"
+JOBS_DIR = MONITOR_DIR / "jobs"
 
 
 class _RenderTelemetry:
-    """Writes live render progress & logs to ~/.config/colab-cli/ so the GUI monitors CLI/agent runs."""
+    """Writes per-run live render progress & logs to ~/.config/colab-cli/jobs/ so the GUI monitors multiple concurrent CLI/agent/GUI runs."""
 
     def __init__(self, *, enabled: bool = True) -> None:
         self.enabled = enabled
         self.run_id = f"{int(time.time())}_{os.getpid()}"
+        self.json_path = JOBS_DIR / f"{self.run_id}.json"
+        self.log_path = JOBS_DIR / f"{self.run_id}.log"
         self.state: dict = {
             "run_id": self.run_id,
             "pid": os.getpid(),
@@ -84,27 +85,40 @@ class _RenderTelemetry:
             "last_frame": "",
             "last_frame_sec": 0.0,
             "avg_frame_sec": 0.0,
+            "last_frame_path": "",
             "started_at": time.time(),
             "updated_at": time.time(),
             "error": "",
         }
         self._frame_times: list[float] = []
         if self.enabled:
-            MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+            JOBS_DIR.mkdir(parents=True, exist_ok=True)
+            self._prune_old()
             try:
-                ACTIVE_RENDER_LOG.write_text("", encoding="utf-8")
+                self.log_path.write_text("", encoding="utf-8")
             except OSError:
                 pass
             self._flush_json()
+
+    def _prune_old(self, keep: int = 20) -> None:
+        try:
+            files = sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in files[keep:]:
+                for ext in (".json", ".log"):
+                    p = old.with_suffix(ext)
+                    if p.exists():
+                        p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _flush_json(self) -> None:
         if not self.enabled:
             return
         self.state["updated_at"] = time.time()
         try:
-            tmp = ACTIVE_RENDER_JSON.with_suffix(".json.tmp")
+            tmp = self.json_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
-            os.replace(tmp, ACTIVE_RENDER_JSON)
+            os.replace(tmp, self.json_path)
         except OSError:
             pass
 
@@ -117,7 +131,7 @@ class _RenderTelemetry:
         if not self.enabled:
             return
         try:
-            with open(ACTIVE_RENDER_LOG, "a", encoding="utf-8", errors="replace") as fh:
+            with open(self.log_path, "a", encoding="utf-8", errors="replace") as fh:
                 fh.write(line + "\n")
         except OSError:
             pass

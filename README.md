@@ -4,8 +4,8 @@ Use **Google Colab GPUs (T4, L4, A100, H100)** directly from your terminal or AI
 
 1. **Colab CLI Studio GUI (`colab_accounts.py` / `Colab_Accounts.bat`)** — zero-CMD desktop app with 3 tabs:
    - **Accounts & CUs:** manage multiple Google accounts in your OS keyring, view live Compute Unit balances/burn rates, switch accounts in 1 click, and stop active VMs.
-   - **Live Monitor:** auto-refreshing GPU VM status, real-time render progress bar + ETA, latest rendered PNG frame thumbnail preview, and live scrolling render log — **automatically monitors renders started by AI agents or terminals too** (via `~/.config/colab-cli/active_render.json`).
-   - **Launch Render:** pick a `.blend` or `jobs.json`, GPU, frame range, and parallel workers to dry-run or render without ever opening CMD.
+   - **Live Monitor:** live table of **all active Colab VMs across every saved account** (with 1-click **Stop Selected VM**), multi-job selector for concurrent renders (`~/.config/colab-cli/jobs/`), real-time progress bar + ETA, latest PNG frame thumbnail preview, and live scrolling log — automatically monitors renders started by AI agents or terminals too.
+   - **Launch Render:** pick a `.blend` or `jobs.json`, session name (`-s`), GPU, frame range, and parallel workers to launch one or multiple concurrent renders without opening CMD.
 2. **Headless Blender Cloud Renderer (`colab_render.py`, `prepare_shot.py`, `cloud_render.py`)** — bundles local scenes/assets, renders with parallel GPU workers, streams finished frames directly to disk, and auto-stops the VM.
 3. **AI-Agent Friendly (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`, `--json` output)** — ready for Claude Code, Codex, Gemini, Cursor, and other coding agents to safely offload heavy GPU jobs without leaving idle VMs running.
 
@@ -113,6 +113,7 @@ Safety guardrails built into the runbooks ensure agents always `--dry-run` Blend
 | `python colab_accounts.py` / `Colab_Accounts.bat` | Open the Account Switcher GUI |
 | `python colab_accounts.py list [--json]` | List saved accounts with live CU balances and active VMs |
 | `python colab_accounts.py active [--json]` | Show active account email, CU balance, burn rate, and active VMs |
+| `python colab_accounts.py vms [--json]` | List all active Colab VMs across every saved account |
 | `python colab_accounts.py switch <email>` | Switch active account (substring match supported) |
 | `python colab_accounts.py stop-vms [email]` | Unassign/stop all running VMs on the active (or specified) account |
 | `python colab_render.py status` | Show local Blender/CLI paths, active account, sessions, and CU balance |

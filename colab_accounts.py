@@ -81,8 +81,7 @@ CONFIG_DIR = Path.home() / ".config" / "colab-cli"
 ACCOUNTS_INDEX_PATH = CONFIG_DIR / "accounts.json"
 SESSIONS_PATH = CONFIG_DIR / "sessions.json"
 PROFILES_DIR = CONFIG_DIR / "profiles"
-ACTIVE_RENDER_JSON = CONFIG_DIR / "active_render.json"
-ACTIVE_RENDER_LOG = CONFIG_DIR / "active_render.log"
+JOBS_DIR = CONFIG_DIR / "jobs"
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +214,60 @@ def _query_account_live_status(token_json: str) -> dict[str, Any]:
         "token_json": creds.to_json() if refreshed else token_json,
         "checked_at": datetime.now().strftime("%H:%M:%S"),
     }
+
+
+def _endpoint_session_map(email: str, *, is_active: bool) -> dict[str, str]:
+    """Map VM endpoint -> local CLI session name for an account."""
+    ep_map: dict[str, str] = {}
+    paths = [SESSIONS_PATH] if is_active else []
+    paths.append(PROFILES_DIR / f"{_safe_slug(email)}_sessions.json")
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for sname, sdata in data.items():
+                    if isinstance(sdata, dict) and sdata.get("endpoint"):
+                        ep_map.setdefault(str(sdata["endpoint"]), str(sname))
+        except Exception:
+            pass
+    return ep_map
+
+
+def stop_one_vm(email: str, endpoint: str) -> None:
+    """Unassign a single Colab VM endpoint on any saved account."""
+    email = email.lower().strip()
+    token_json = _get_account_token_json(email)
+    if not token_json:
+        idx = _load_index()
+        if idx.get("active") == email:
+            token_json = _get_active_token_json()
+    if not token_json:
+        raise RuntimeError(f"No stored token for {email}")
+
+    creds = _credentials_from_json(token_json)
+    if not creds.valid or not creds.token:
+        creds.refresh(Request())
+    client = Client(Prod(), AuthorizedSession(creds))
+    client.unassign(endpoint)
+
+    # Prune this endpoint from local session files if present
+    idx = _load_index()
+    paths = [PROFILES_DIR / f"{_safe_slug(email)}_sessions.json"]
+    if idx.get("active") == email:
+        paths.append(SESSIONS_PATH)
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cleaned = {k: v for k, v in data.items() if not (isinstance(v, dict) and v.get("endpoint") == endpoint)}
+                if len(cleaned) != len(data):
+                    p.write_text(json.dumps(cleaned, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
 
 def stop_all_vms_for_account(email: str) -> int:
@@ -516,8 +569,17 @@ def launch_gui() -> int:
     live_cache: dict[str, dict[str, Any]] = {}
     busy = {"refresh": False}
     auto_refresh_var = tk.BooleanVar(value=True)
-    log_state: dict[str, Any] = {"run_id": None, "offset": 0, "last_out_dir": "", "thumb_path": "", "thumb_img": None}
-    gui_proc_ref: dict[str, Optional[subprocess.Popen]] = {"proc": None}
+    log_state: dict[str, Any] = {
+        "selected_run_id": None,
+        "tailed_run_id": None,
+        "offset": 0,
+        "last_out_dir": "",
+        "thumb_path": "",
+        "thumb_img": None,
+        "jobs_by_label": {},
+        "jobs_by_id": {},
+    }
+    gui_procs: list[subprocess.Popen] = []
 
     # --- Status bar packed FIRST at bottom ---
     status_var = tk.StringVar(value="Ready.")
@@ -606,21 +668,52 @@ def launch_gui() -> int:
     tree.pack(fill="both", expand=True, padx=1, pady=1)
 
     # =========================================================================
-    # TAB 2: LIVE MONITOR (monitors BOTH agent/CLI renders and GUI renders!)
+    # TAB 2: LIVE MONITOR (monitors ALL active VMs across accounts + multiple concurrent render jobs)
     # =========================================================================
-    mon_top = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    mon_top.pack(fill="x", pady=(10, 8))
+    # 1) All Active Colab VMs table (across ALL saved accounts)
+    vm_hdr = tk.Frame(tab_monitor, bg=BG)
+    vm_hdr.pack(fill="x", pady=(8, 4))
+    tk.Label(vm_hdr, text="ACTIVE COLAB VMs (ALL SAVED ACCOUNTS)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+    lbl_total_vms = tk.Label(vm_hdr, text="0 running", bg=BG, fg=GREEN, font=("Segoe UI", 8, "bold"))
+    lbl_total_vms.pack(side="left", padx=(10, 0))
+    vm_hdr_btns = tk.Frame(vm_hdr, bg=BG)
+    vm_hdr_btns.pack(side="right")
 
-    mon_hdr = tk.Frame(mon_top, bg=CARD)
-    mon_hdr.pack(fill="x", padx=14, pady=(10, 4))
-    lbl_job_title = tk.Label(mon_hdr, text="No active render job", bg=CARD, fg=TEXT, font=("Segoe UI", 11, "bold"))
-    lbl_job_title.pack(side="left")
-    lbl_job_badge = tk.Label(mon_hdr, text="IDLE", bg=CARD_ALT, fg=MUTED, padx=8, pady=2, font=("Segoe UI", 8, "bold"))
+    vm_tree_wrap = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+    vm_tree_wrap.pack(fill="x", pady=(0, 8))
+    vm_cols = ("account", "session", "gpu", "shape", "endpoint", "rate")
+    vm_tree = ttk.Treeview(vm_tree_wrap, columns=vm_cols, show="headings", style="Dark.Treeview", selectmode="browse", height=3)
+    vm_tree.heading("account", text="Account")
+    vm_tree.heading("session", text="Session")
+    vm_tree.heading("gpu", text="GPU")
+    vm_tree.heading("shape", text="Shape")
+    vm_tree.heading("endpoint", text="Endpoint")
+    vm_tree.heading("rate", text="Acct Burn")
+    vm_tree.column("account", width=220, anchor="w", stretch=True)
+    vm_tree.column("session", width=130, anchor="w", stretch=False)
+    vm_tree.column("gpu", width=70, anchor="center", stretch=False)
+    vm_tree.column("shape", width=85, anchor="center", stretch=False)
+    vm_tree.column("endpoint", width=170, anchor="w", stretch=False)
+    vm_tree.column("rate", width=85, anchor="e", stretch=False)
+    vm_tree.pack(fill="x", padx=1, pady=1)
+    vm_row_map: dict[str, tuple[str, str]] = {}
+
+    # 2) Render Job selector + live progress card
+    mon_top = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+    mon_top.pack(fill="x", pady=(0, 8))
+
+    mon_sel_row = tk.Frame(mon_top, bg=CARD)
+    mon_sel_row.pack(fill="x", padx=14, pady=(8, 4))
+    tk.Label(mon_sel_row, text="RENDER JOB:", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+    job_sel_var = tk.StringVar(value="No render jobs yet")
+    job_combo = ttk.Combobox(mon_sel_row, textvariable=job_sel_var, state="readonly", style="Dark.TCombobox", width=54)
+    job_combo.pack(side="left", padx=(8, 8), fill="x", expand=True)
+    lbl_job_badge = tk.Label(mon_sel_row, text="IDLE", bg=CARD_ALT, fg=MUTED, padx=8, pady=2, font=("Segoe UI", 8, "bold"))
     lbl_job_badge.pack(side="right")
 
     lbl_job_detail = tk.Label(
         mon_top,
-        text="Start a render from 'Launch Render' or via CLI/agent — live progress & logs appear here automatically.",
+        text="Start a render from 'Launch Render' or via CLI/agent — multiple concurrent jobs appear in the dropdown above.",
         bg=CARD,
         fg=MUTED,
         font=("Segoe UI", 9),
@@ -631,31 +724,22 @@ def launch_gui() -> int:
     pbar.pack(fill="x", padx=14, pady=(0, 6))
 
     mon_bar_row = tk.Frame(mon_top, bg=CARD)
-    mon_bar_row.pack(fill="x", padx=14, pady=(0, 10))
+    mon_bar_row.pack(fill="x", padx=14, pady=(0, 8))
     lbl_job_progress = tk.Label(mon_bar_row, text="0 / 0 frames", bg=CARD, fg=MUTED, font=("Segoe UI", 9))
     lbl_job_progress.pack(side="left")
     mon_btns = tk.Frame(mon_bar_row, bg=CARD)
     mon_btns.pack(side="right")
 
-    # Active VMs strip inside Monitor
-    vm_strip = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    vm_strip.pack(fill="x", pady=(0, 8))
-    vm_inner = tk.Frame(vm_strip, bg=CARD)
-    vm_inner.pack(fill="x", padx=14, pady=8)
-    tk.Label(vm_inner, text="LIVE COLAB VMs:", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-    lbl_live_vms = tk.Label(vm_inner, text="None running", bg=CARD, fg=TEXT, font=("Segoe UI", 9))
-    lbl_live_vms.pack(side="left", padx=(8, 0))
-
-    # Scrolling Live Render Log + Latest Frame Thumbnail Preview side-by-side
+    # 3) Scrolling Live Render Log + Latest Frame Thumbnail Preview side-by-side
     log_hdr = tk.Frame(tab_monitor, bg=BG)
     log_hdr.pack(fill="x", pady=(0, 4))
-    tk.Label(log_hdr, text="LIVE RENDER LOG (CLI, AI agents & GUI)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+    tk.Label(log_hdr, text="LIVE RENDER LOG (SELECTED JOB)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
     tk.Label(log_hdr, text="LATEST FRAME PREVIEW", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="right", padx=(0, 8))
 
     mon_bottom = tk.Frame(tab_monitor, bg=BG)
     mon_bottom.pack(fill="both", expand=True, pady=(0, 4))
 
-    preview_wrap = tk.Frame(mon_bottom, bg=CARD, highlightbackground=BORDER, highlightthickness=1, width=270)
+    preview_wrap = tk.Frame(mon_bottom, bg=CARD, highlightbackground=BORDER, highlightthickness=1, width=260)
     preview_wrap.pack(side="right", fill="y", padx=(8, 0))
     preview_wrap.pack_propagate(False)
     lbl_preview_img = tk.Label(preview_wrap, text="Latest downloaded\nPNG frame appears\nhere automatically", bg=CARD, fg=MUTED, font=("Segoe UI", 9), justify="center")
@@ -730,6 +814,7 @@ def launch_gui() -> int:
     samples_var = tk.StringVar(value="0")
     gpu_var = tk.StringVar(value="L4")
     par_var = tk.StringVar(value="3")
+    session_var = tk.StringVar(value="blender-render")
     extras_var = tk.StringVar(value="")
     keep_var = tk.BooleanVar(value=False)
 
@@ -809,12 +894,14 @@ def launch_gui() -> int:
     r4 = tk.Frame(rf, bg=CARD)
     r4.pack(fill="x", pady=(0, 10))
     tk.Label(r4, text="GPU / Workers:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    ttk.Combobox(r4, textvariable=gpu_var, values=("L4", "T4", "A100", "H100", "G4", "CPU"), width=8, state="readonly", style="Dark.TCombobox").pack(side="left")
-    tk.Label(r4, text="Parallel:", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(16, 6))
+    ttk.Combobox(r4, textvariable=gpu_var, values=("L4", "T4", "A100", "H100", "G4", "CPU"), width=7, state="readonly", style="Dark.TCombobox").pack(side="left")
+    tk.Label(r4, text="Parallel:", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(14, 6))
     ttk.Combobox(r4, textvariable=par_var, values=("1", "2", "3", "4"), width=4, state="readonly", style="Dark.TCombobox").pack(side="left")
+    tk.Label(r4, text="Session (-s):", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(14, 6))
+    _entry(r4, session_var, width=16).pack(side="left", ipady=4)
     tk.Checkbutton(
         r4,
-        text="Keep VM alive after render (--keep)",
+        text="Keep VM (--keep)",
         variable=keep_var,
         bg=CARD,
         fg=TEXT,
@@ -822,7 +909,7 @@ def launch_gui() -> int:
         activebackground=CARD,
         activeforeground=TEXT,
         font=("Segoe UI", 9),
-    ).pack(side="left", padx=(18, 0))
+    ).pack(side="left", padx=(14, 0))
 
     r5 = tk.Frame(rf, bg=CARD)
     r5.pack(fill="x", pady=(0, 6))
@@ -863,13 +950,6 @@ def launch_gui() -> int:
                 vm_text = f"{vms} active VM{'s' if vms != 1 else ''}"
                 lbl_vm_val.configure(text=vm_text, fg=AMBER if vms else MUTED)
                 btn_stop_vms.configure(state="normal" if vms else "disabled")
-                if assigns:
-                    vm_desc = "  |  ".join(f"{a.get('accelerator', '?')} ({a.get('endpoint', '')[:12]}…)" for a in assigns)
-                    lbl_live_vms.configure(text=vm_desc, fg=AMBER)
-                elif vms:
-                    lbl_live_vms.configure(text=f"{vms} active runtime(s)", fg=AMBER)
-                else:
-                    lbl_live_vms.configure(text="None running (0.00 CU/hr)", fg=GREEN)
             else:
                 lbl_cu_val.configure(text="… CU", fg=MUTED)
                 lbl_active_meta.configure(text="Loading live Compute Units balance…")
@@ -881,7 +961,6 @@ def launch_gui() -> int:
             lbl_active_meta.configure(text="Click '+ Add Account' below to connect a Google account.")
             lbl_cu_val.configure(text="— CU", fg=MUTED)
             lbl_vm_val.configure(text="0 active VMs", fg=MUTED)
-            lbl_live_vms.configure(text="Not signed in", fg=MUTED)
             lbl_checked.configure(text="")
             btn_stop_vms.configure(state="disabled")
 
@@ -910,23 +989,98 @@ def launch_gui() -> int:
         elif active_email and active_email in accounts:
             tree.selection_set(active_email)
 
-    def poll_render_monitor() -> None:
+        # Populate Live Monitor VM table across ALL saved accounts
+        vm_sel = vm_tree.selection()
+        prev_vm_sel = vm_sel[0] if vm_sel else None
+        for item in vm_tree.get_children():
+            vm_tree.delete(item)
+        vm_row_map.clear()
+        total_running = 0
+        for email in sorted(accounts.keys()):
+            meta = live_cache.get(email) or {}
+            assigns = meta.get("assignments") or []
+            if not assigns:
+                continue
+            ep_map = _endpoint_session_map(email, is_active=(email == active_email))
+            rate_val = meta.get("rate", 0.0)
+            for a in assigns:
+                ep = str(a.get("endpoint", ""))
+                sname = ep_map.get(ep, "(browser / external)")
+                acc_lbl = f"● {email}" if email == active_email else email
+                row_id = f"{email}::{ep}"
+                vm_row_map[row_id] = (email, ep)
+                vm_tree.insert(
+                    "",
+                    "end",
+                    iid=row_id,
+                    values=(acc_lbl, sname, a.get("accelerator", "?"), a.get("shape", "STD"), ep[:22], f"{rate_val:.2f}/hr"),
+                )
+                total_running += 1
+        if prev_vm_sel and prev_vm_sel in vm_row_map:
+            vm_tree.selection_set(prev_vm_sel)
+        lbl_total_vms.configure(
+            text=f"{total_running} running across all accounts" if total_running else "0 running (0.00 CU/hr)",
+            fg=AMBER if total_running else GREEN,
+        )
+        btn_stop_one_vm.configure(state="normal" if total_running else "disabled")
+
+    def _on_job_selected(_event=None) -> None:
+        lbl = job_sel_var.get()
+        rid = log_state["jobs_by_label"].get(lbl)
+        if rid:
+            log_state["selected_run_id"] = rid
+            poll_render_monitor(reschedule=False)
+
+    job_combo.bind("<<ComboboxSelected>>", _on_job_selected)
+
+    def poll_render_monitor(*, reschedule: bool = True) -> None:
         try:
-            if ACTIVE_RENDER_JSON.is_file():
-                data = json.loads(ACTIVE_RENDER_JSON.read_text(encoding="utf-8"))
-                run_id = data.get("run_id")
+            active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
+            job_entries: list[tuple[str, dict[str, Any], Path]] = []
+            if JOBS_DIR.is_dir():
+                for jp in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:15]:
+                    try:
+                        d = json.loads(jp.read_text(encoding="utf-8"))
+                        rid = str(d.get("run_id") or jp.stem)
+                        st = str(d.get("status", "idle"))
+                        pid = int(d.get("pid") or 0)
+                        if st in active_states and pid and not _is_pid_alive(pid):
+                            d["status"] = "stopped"
+                        job_entries.append((rid, d, jp.with_suffix(".log")))
+                    except Exception:
+                        pass
+
+            # Build dropdown labels (active jobs first, then recent finished)
+            job_entries.sort(key=lambda x: (0 if x[1].get("status") in active_states else 1, -float(x[1].get("updated_at") or 0)))
+            labels = []
+            by_label: dict[str, str] = {}
+            by_id: dict[str, tuple[dict[str, Any], Path, str]] = {}
+            for rid, d, lp in job_entries:
+                st = str(d.get("status", "idle")).upper()
+                jname = d.get("job_name") or Path(d.get("blend") or rid).name
+                done_f = int(d.get("done_frames") or 0)
+                tot_f = int(d.get("total_frames") or 0)
+                gpu = d.get("gpu") or "?"
+                sess = d.get("session") or ""
+                lbl = f"[{st}] {jname} ({done_f}/{tot_f}) — {gpu} / {sess} [{rid[-5:]}]"
+                labels.append(lbl)
+                by_label[lbl] = rid
+                by_id[rid] = (d, lp, lbl)
+
+            log_state["jobs_by_label"] = by_label
+            log_state["jobs_by_id"] = by_id
+
+            if labels:
+                job_combo.configure(values=labels)
+                sel_rid = log_state["selected_run_id"]
+                if not sel_rid or sel_rid not in by_id:
+                    sel_rid = job_entries[0][0]
+                    log_state["selected_run_id"] = sel_rid
+                data, log_path, cur_lbl = by_id[sel_rid]
+                if job_sel_var.get() != cur_lbl:
+                    job_sel_var.set(cur_lbl)
+
                 st = str(data.get("status", "idle"))
-                pid = int(data.get("pid") or 0)
-                active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
-                if st in active_states and pid and not _is_pid_alive(pid):
-                    st = "stopped"
-
-                job_name = data.get("job_name") or Path(data.get("blend") or "Render").name
-                j_idx = data.get("job_index") or 0
-                j_cnt = data.get("job_count") or 0
-                prefix_idx = f"[{j_idx}/{j_cnt}] " if j_cnt > 1 else ""
-                lbl_job_title.configure(text=f"{prefix_idx}{job_name}")
-
                 badge_colors = {
                     "rendering": (GREEN, "#132a1c"),
                     "uploading": (ACCENT, "#172554"),
@@ -963,15 +1117,15 @@ def launch_gui() -> int:
                 else:
                     lbl_job_detail.configure(text=f"GPU: {gpu} • {par} worker(s) • session: {sess} • out: {out_dir}", fg=MUTED)
                 btn_open_out.configure(state="normal" if out_dir and os.path.exists(out_dir) else "disabled")
-                btn_cancel_render.configure(state="normal" if (gui_proc_ref["proc"] is not None or st in active_states) else "disabled")
+                btn_cancel_render.configure(state="normal" if st in active_states else "disabled")
 
-                # Update live frame preview thumbnail if a new PNG landed on disk
+                # Update live frame preview thumbnail
                 fp = data.get("last_frame_path") or ""
                 if fp and fp != log_state["thumb_path"] and os.path.isfile(fp) and fp.lower().endswith(".png"):
                     try:
                         img = tk.PhotoImage(file=fp)
                         w_i, h_i = img.width(), img.height()
-                        scale = max(1, int(max(w_i / 252, h_i / 170)))
+                        scale = max(1, int(max(w_i / 242, h_i / 150)))
                         if scale > 1:
                             img = img.subsample(scale, scale)
                         log_state["thumb_img"] = img
@@ -981,25 +1135,26 @@ def launch_gui() -> int:
                     except Exception:
                         pass
 
-                # Tail active_render.log incrementally
-                if run_id != log_state["run_id"]:
-                    log_state["run_id"] = run_id
+                # Tail selected job's log incrementally
+                if sel_rid != log_state["tailed_run_id"]:
+                    log_state["tailed_run_id"] = sel_rid
                     log_state["offset"] = 0
                     clear_log_box()
-                if ACTIVE_RENDER_LOG.is_file():
-                    sz = ACTIVE_RENDER_LOG.stat().st_size
+                if log_path.is_file():
+                    sz = log_path.stat().st_size
                     if sz < log_state["offset"]:
                         log_state["offset"] = 0
                         clear_log_box()
                     if sz > log_state["offset"]:
-                        with open(ACTIVE_RENDER_LOG, "rb") as fh:
+                        with open(log_path, "rb") as fh:
                             fh.seek(log_state["offset"])
                             chunk = fh.read()
                             log_state["offset"] = fh.tell()
                         append_log_lines(chunk.decode("utf-8", errors="replace"))
         except Exception:
             pass
-        root.after(1500, poll_render_monitor)
+        if reschedule:
+            root.after(1500, poll_render_monitor)
 
     def refresh_all(*, sync_first: bool = True, silent: bool = False) -> None:
         if busy["refresh"]:
@@ -1141,10 +1296,35 @@ def launch_gui() -> int:
         render_accounts_ui()
         set_status(f"Removed {email}.", MUTED)
 
-    def do_launch_render(*, dry_run: bool) -> None:
-        if gui_proc_ref["proc"] is not None:
-            messagebox.showwarning("Render Running", "A render launched from this GUI is already running.")
+    def do_stop_one_vm() -> None:
+        sel = vm_tree.selection()
+        if not sel or sel[0] not in vm_row_map:
+            messagebox.showinfo("Select VM", "Select a running VM in the Active Colab VMs table first.")
             return
+        email, ep = vm_row_map[sel[0]]
+        if not messagebox.askyesno("Stop Selected VM", f"Disconnect and delete VM `{ep[:22]}…` on {email}?"):
+            return
+        set_status(f"Stopping VM {ep[:14]}… on {email}...", AMBER)
+
+        def worker() -> None:
+            try:
+                stop_one_vm(email, ep)
+                root.after(0, lambda: _done(None))
+            except Exception as e:
+                err_s = str(e)
+                root.after(0, lambda: _done(err_s))
+
+        def _done(err: Optional[str]) -> None:
+            if err:
+                messagebox.showerror("Stop VM Failed", err)
+                set_status(f"Stop VM failed: {err}", RED)
+            else:
+                set_status(f"Stopped VM on {email}.", GREEN)
+                refresh_all(sync_first=False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def do_launch_render(*, dry_run: bool) -> None:
         if not RENDER_SCRIPT.is_file():
             messagebox.showerror("Missing Script", f"Could not find {RENDER_SCRIPT}")
             return
@@ -1174,7 +1354,8 @@ def launch_gui() -> int:
                 for tok in shlex.split(extras_var.get().strip()):
                     cmd += ["--extra", tok]
 
-        cmd += ["--gpu", gpu_var.get() or "L4", "--par", par_var.get() or "3"]
+        sess_name = session_var.get().strip() or "blender-render"
+        cmd += ["--gpu", gpu_var.get() or "L4", "--par", par_var.get() or "3", "-s", sess_name]
         if keep_var.get():
             cmd.append("--keep")
         if dry_run:
@@ -1182,17 +1363,20 @@ def launch_gui() -> int:
 
         nb.select(tab_monitor)
         if dry_run:
+            log_state["selected_run_id"] = None
+            log_state["tailed_run_id"] = "__dry__"
             clear_log_box()
             append_log_lines(f"[gui] Dry run: {' '.join(cmd)}\n")
-        set_status("Dry-running shot..." if dry_run else "Render started (no CMD window). Watching live progress...", ACCENT)
-        btn_start_render.configure(state="disabled")
-        btn_dry_run.configure(state="disabled")
-        btn_cancel_render.configure(state="normal")
+        else:
+            # Auto-select the newly spawned job once its telemetry file appears
+            log_state["selected_run_id"] = None
+        set_status("Dry-running shot..." if dry_run else f"Render started on session '{sess_name}' (no CMD window).", ACCENT)
 
         def worker() -> None:
             env = os.environ.copy()
             env["PYTHONUTF8"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
+            proc = None
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -1204,7 +1388,7 @@ def launch_gui() -> int:
                     env=env,
                     creationflags=CREATION_FLAGS,
                 )
-                gui_proc_ref["proc"] = proc
+                gui_procs.append(proc)
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     if dry_run:
@@ -1216,15 +1400,17 @@ def launch_gui() -> int:
                 root.after(0, lambda: append_log_lines(f"[error] {err_s}\n"))
                 rc = 1
             finally:
-                gui_proc_ref["proc"] = None
+                if proc in gui_procs:
+                    gui_procs.remove(proc)
 
             def _done() -> None:
-                btn_start_render.configure(state="normal")
-                btn_dry_run.configure(state="normal")
                 if dry_run:
                     set_status("Dry run finished." if rc == 0 else f"Dry run failed (rc={rc}).", GREEN if rc == 0 else RED)
                 else:
-                    set_status("Render finished!" if rc == 0 else f"Render ended with rc={rc}.", GREEN if rc == 0 else AMBER)
+                    set_status(
+                        f"Render '{sess_name}' finished!" if rc == 0 else f"Render '{sess_name}' ended (rc={rc}).",
+                        GREEN if rc == 0 else AMBER,
+                    )
                     refresh_all(sync_first=False)
 
             root.after(0, _done)
@@ -1232,18 +1418,41 @@ def launch_gui() -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     def do_cancel_render() -> None:
-        proc = gui_proc_ref["proc"]
-        if proc is not None:
-            if not messagebox.askyesno("Stop Render", "Terminate this render process and stop active Colab VMs?"):
-                return
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            set_status("Render terminated — stopping any active Colab VMs...", AMBER)
+        sel_rid = log_state.get("selected_run_id")
+        entry = log_state["jobs_by_id"].get(sel_rid) if sel_rid else None
+        if not entry:
             do_stop_vms()
-        else:
-            do_stop_vms()
+            return
+        data = entry[0]
+        pid = int(data.get("pid") or 0)
+        sess = data.get("session") or ""
+        if not messagebox.askyesno(
+            "Stop Selected Render",
+            f"Terminate render job '{data.get('job_name', '')}' (session: {sess}, pid: {pid})?",
+        ):
+            return
+        if pid and _is_pid_alive(pid):
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], creationflags=CREATION_FLAGS, check=False)
+            else:
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+        # Also stop that specific session if it exists on the active account
+        if sess:
+            idx = _load_index()
+            active_em = idx.get("active")
+            if active_em:
+                ep_map = _endpoint_session_map(active_em, is_active=True)
+                for ep, sname in ep_map.items():
+                    if sname == sess:
+                        try:
+                            stop_one_vm(active_em, ep)
+                        except Exception:
+                            pass
+        set_status(f"Stopped job '{data.get('job_name', '')}'.", AMBER)
+        refresh_all(sync_first=False)
 
     def open_add_account_dialog() -> None:
         try:
@@ -1381,10 +1590,14 @@ def launch_gui() -> int:
     btn_stop_vms.pack(side="left", padx=(8, 0))
     make_btn(acc_actions, "Remove Selected", do_remove).pack(side="right")
 
+    btn_stop_one_vm = make_btn(vm_hdr_btns, "Stop Selected VM", do_stop_one_vm, bg="#3b1d20", fg="#fca5a5", hover="#58262b", pady=3)
+    btn_stop_one_vm.pack(side="left")
+    btn_stop_one_vm.configure(state="disabled")
+
     btn_open_out = make_btn(mon_btns, "Open Output Folder", lambda: _open_path_in_explorer(log_state["last_out_dir"]), pady=4)
     btn_open_out.pack(side="left", padx=(0, 8))
     btn_open_out.configure(state="disabled")
-    btn_cancel_render = make_btn(mon_btns, "Stop Render / VMs", do_cancel_render, bg="#3b1d20", fg="#fca5a5", hover="#58262b", pady=4)
+    btn_cancel_render = make_btn(mon_btns, "Stop Selected Job", do_cancel_render, bg="#3b1d20", fg="#fca5a5", hover="#58262b", pady=4)
     btn_cancel_render.pack(side="left")
     btn_cancel_render.configure(state="disabled")
 
@@ -1507,7 +1720,44 @@ def main(argv: list[str]) -> int:
             print(f"Stopped {n} active VM(s) on {em}.")
         return 0
 
-    raise SystemExit(f"Unknown command: {cmd}. Expected: gui | list | active | switch <email> | stop-vms [email]")
+    if cmd == "vms":
+        sync_current_cli_login()
+        idx = _load_index()
+        active = idx.get("active")
+        all_vms = []
+        for em in sorted(idx.get("accounts", {}).keys()):
+            tok = _get_account_token_json(em)
+            if not tok:
+                continue
+            try:
+                info = _query_account_live_status(tok)
+                ep_map = _endpoint_session_map(em, is_active=(em == active))
+                for a in info["assignments"]:
+                    all_vms.append(
+                        {
+                            "account": em,
+                            "active_account": em == active,
+                            "session": ep_map.get(a["endpoint"], "(browser / external)"),
+                            "accelerator": a["accelerator"],
+                            "shape": a["shape"],
+                            "endpoint": a["endpoint"],
+                            "rate": info["rate"],
+                        }
+                    )
+            except Exception:
+                pass
+        if as_json:
+            print(json.dumps({"vms": all_vms}, indent=2))
+            return 0
+        if not all_vms:
+            print("No active Colab VMs across any saved accounts.")
+            return 0
+        for v in all_vms:
+            mark = "*" if v["active_account"] else " "
+            print(f"{mark} {v['account']:32s}  {v['session']:18s}  {v['accelerator']:5s}  {v['endpoint'][:22]}  ({v['rate']:.2f}/hr)")
+        return 0
+
+    raise SystemExit(f"Unknown command: {cmd}. Expected: gui | list | active | vms | switch <email> | stop-vms [email]")
 
 
 if __name__ == "__main__":
