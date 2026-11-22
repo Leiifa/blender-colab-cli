@@ -613,8 +613,8 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
 
     root = tk.Tk()
     root.title("Colab Render")
-    root.geometry("940x650")
-    root.minsize(820, 560)
+    root.geometry("1040x660")
+    root.minsize(900, 560)
     root.configure(bg=BG)
 
     style = ttk.Style(root)
@@ -757,16 +757,15 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         w.bind("<Button-1>", lambda _e: nb.select(tab_accounts))
 
     # =========================================================================
-    # TAB 1: MONITOR
+    # TAB 1: MONITOR (left Jobs sidebar + right Progress / Log / Preview)
     # =========================================================================
-    # Bottom VM strip packed FIRST so main log/preview always gets remaining space
+    # Bottom VM strip packed FIRST so main content always gets remaining space
     vm_section = tk.Frame(tab_monitor, bg=SURFACE)
     vm_section.pack(fill="x", side="bottom", pady=(8, 0))
 
     vm_top = tk.Frame(vm_section, bg=SURFACE)
     vm_top.pack(fill="x", padx=14, pady=(8, 4))
-    lbl_vm_hdr = tk.Label(vm_top, text="Running VMs", bg=SURFACE, fg=TEXT, font=("Segoe UI", 9, "bold"))
-    lbl_vm_hdr.pack(side="left")
+    tk.Label(vm_top, text="Running VMs", bg=SURFACE, fg=TEXT, font=("Segoe UI", 9, "bold")).pack(side="left")
     lbl_total_vms = tk.Label(vm_top, text="None", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
     lbl_total_vms.pack(side="left", padx=(8, 0))
     vm_hdr_btns = tk.Frame(vm_top, bg=SURFACE)
@@ -785,19 +784,56 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     vm_tree.pack(fill="x", padx=10, pady=(0, 8))
     vm_row_map: dict[str, tuple[str, str]] = {}
 
-    # Top Progress Card
-    mon_top = tk.Frame(tab_monitor, bg=SURFACE)
-    mon_top.pack(fill="x", pady=(10, 8))
+    # Main Master-Detail split
+    mon_body = tk.Frame(tab_monitor, bg=BG)
+    mon_body.pack(fill="both", expand=True, pady=(10, 0))
+
+    # Left Sidebar: live Jobs list (zero white dropdowns, all jobs visible at once!)
+    jobs_sidebar = tk.Frame(mon_body, bg=SURFACE, width=260)
+    jobs_sidebar.pack(side="left", fill="y", padx=(0, 10))
+    jobs_sidebar.pack_propagate(False)
+
+    js_hdr = tk.Frame(jobs_sidebar, bg=SURFACE)
+    js_hdr.pack(fill="x", padx=12, pady=(10, 6))
+    tk.Label(js_hdr, text="Jobs", bg=SURFACE, fg=TEXT, font=("Segoe UI", 9, "bold")).pack(side="left")
+    btn_clear_hist = make_btn(js_hdr, "Clear", lambda: do_clear_history(), bg=SURFACE, hover=CONTROL, fg=MUTED, padx=8, pady=2, font_size=8)
+    btn_clear_hist.pack(side="right")
+
+    jobs_tree = ttk.Treeview(
+        jobs_sidebar,
+        columns=("name", "prog", "state"),
+        show="headings",
+        style="Clean.Treeview",
+        selectmode="browse",
+    )
+    jobs_tree.heading("name", text="Shot")
+    jobs_tree.heading("prog", text="Frames")
+    jobs_tree.heading("state", text="Status")
+    jobs_tree.column("name", width=104, anchor="w", stretch=True)
+    jobs_tree.column("prog", width=66, anchor="e", stretch=False)
+    jobs_tree.column("state", width=72, anchor="e", stretch=False)
+    jobs_tree.tag_configure("active", foreground=GREEN)
+    jobs_tree.tag_configure("busy", foreground=AMBER)
+    jobs_tree.tag_configure("done", foreground=TEXT)
+    jobs_tree.tag_configure("error", foreground=RED)
+    jobs_tree.tag_configure("stopped", foreground=MUTED)
+    jobs_tree.pack(fill="both", expand=True, padx=6, pady=(0, 8))
+
+    # Right Detail Pane: Progress card + Log + Frame Preview
+    mon_detail = tk.Frame(mon_body, bg=BG)
+    mon_detail.pack(side="left", fill="both", expand=True)
+
+    mon_top = tk.Frame(mon_detail, bg=SURFACE)
+    mon_top.pack(fill="x", pady=(0, 8))
 
     mon_row1 = tk.Frame(mon_top, bg=SURFACE)
     mon_row1.pack(fill="x", padx=14, pady=(10, 6))
-    job_sel_var = tk.StringVar(value="No recent renders")
-    job_combo = ttk.Combobox(mon_row1, textvariable=job_sel_var, state="readonly", style="Clean.TCombobox", width=48)
-    job_combo.pack(side="left", fill="x", expand=True)
-    btn_clear_hist = make_btn(mon_row1, "Clear", lambda: do_clear_history(), bg=SURFACE, hover=CONTROL, fg=MUTED, padx=8, pady=3, font_size=8)
-    btn_clear_hist.pack(side="right", padx=(6, 0))
+    lbl_job_title = tk.Label(mon_row1, text="No job selected", bg=SURFACE, fg=TEXT, font=("Segoe UI", 11, "bold"))
+    lbl_job_title.pack(side="left")
+    lbl_job_meta = tk.Label(mon_row1, text="", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
+    lbl_job_meta.pack(side="left", padx=(10, 0))
     lbl_job_badge = tk.Label(mon_row1, text="Idle", bg=CONTROL, fg=MUTED, padx=10, pady=3, font=("Segoe UI", 8, "bold"))
-    lbl_job_badge.pack(side="right", padx=(10, 0))
+    lbl_job_badge.pack(side="right")
 
     pbar = ttk.Progressbar(mon_top, style="Clean.Horizontal.TProgressbar", mode="determinate", maximum=100, value=0)
     pbar.pack(fill="x", padx=14, pady=(0, 8))
@@ -809,12 +845,12 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     mon_btns = tk.Frame(mon_row2, bg=SURFACE)
     mon_btns.pack(side="right")
 
-    # Middle Split: Log (left) + Frame Preview (right)
-    mon_mid = tk.Frame(tab_monitor, bg=BG)
+    # Detail Bottom Split: Log (left) + Frame Preview (right)
+    mon_mid = tk.Frame(mon_detail, bg=BG)
     mon_mid.pack(fill="both", expand=True)
 
-    preview_card = tk.Frame(mon_mid, bg=SURFACE, width=300)
-    preview_card.pack(side="right", fill="y", padx=(10, 0))
+    preview_card = tk.Frame(mon_mid, bg=SURFACE, width=265)
+    preview_card.pack(side="right", fill="y", padx=(8, 0))
     preview_card.pack_propagate(False)
     lbl_preview_img = tk.Label(
         preview_card,
@@ -953,15 +989,45 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     _entry(r3, samples_var, width=7).pack(side="left", ipady=5)
     tk.Label(r3, text="(0 = default)", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
 
+    def _segmented(parent, var: tk.StringVar, options: tuple[str, ...]) -> None:
+        wrap = tk.Frame(parent, bg=BG)
+        wrap.pack(side="left")
+        btns: dict[str, tk.Button] = {}
+
+        def _refresh_seg() -> None:
+            cur = var.get()
+            for val, b in btns.items():
+                if val == cur:
+                    b.configure(bg=ACCENT, fg=TEXT, activebackground=ACCENT_HOVER)
+                else:
+                    b.configure(bg=CONTROL, fg=MUTED, activebackground=HOVER)
+
+        for val in options:
+            b = tk.Button(
+                wrap,
+                text=val,
+                command=lambda v=val: (var.set(v), _refresh_seg()),
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=10,
+                pady=4,
+                font=("Segoe UI", 9),
+            )
+            b.pack(side="left", padx=(0, 2))
+            btns[val] = b
+        _refresh_seg()
+
     r4 = _row("GPU")
-    ttk.Combobox(r4, textvariable=gpu_var, values=("L4", "T4", "A100", "H100", "G4", "CPU"), width=7, state="readonly", style="Clean.TCombobox").pack(side="left")
-    tk.Label(r4, text="Workers", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(20, 8))
-    ttk.Combobox(r4, textvariable=par_var, values=("1", "2", "3", "4"), width=4, state="readonly", style="Clean.TCombobox").pack(side="left")
-    tk.Label(r4, text="Session", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(20, 8))
-    _entry(r4, session_var, width=16).pack(side="left", ipady=5)
+    _segmented(r4, gpu_var, ("L4", "T4", "A100", "H100", "CPU"))
+    tk.Label(r4, text="Workers", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
+    _segmented(r4, par_var, ("1", "2", "3", "4"))
+
+    r4b = _row("Session")
+    _entry(r4b, session_var, width=20).pack(side="left", ipady=5)
     tk.Checkbutton(
-        r4,
-        text="Keep VM open",
+        r4b,
+        text="Keep VM open after render",
         variable=keep_var,
         bg=SURFACE,
         fg=TEXT,
@@ -1093,20 +1159,23 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         btn_stop_one_vm.configure(state="normal" if total_running else "disabled")
 
     def _on_job_selected(_event=None) -> None:
-        lbl = job_sel_var.get()
-        rid = log_state["jobs_by_label"].get(lbl)
-        if rid:
-            log_state["selected_run_id"] = rid
+        sel = jobs_tree.selection()
+        if sel and sel[0] != log_state["selected_run_id"]:
+            log_state["selected_run_id"] = sel[0]
+            log_state["thumb_path"] = ""
+            log_state["thumb_img"] = None
+            lbl_preview_img.configure(image="", text="Latest frame")
+            lbl_preview_cap.configure(text="")
             poll_render_monitor(reschedule=False)
 
-    job_combo.bind("<<ComboboxSelected>>", _on_job_selected)
+    jobs_tree.bind("<<TreeviewSelect>>", _on_job_selected)
 
     def poll_render_monitor(*, reschedule: bool = True) -> None:
         try:
             active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
             job_entries: list[tuple[str, dict[str, Any], Path]] = []
             if JOBS_DIR.is_dir():
-                for jp in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:15]:
+                for jp in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
                     try:
                         d = json.loads(jp.read_text(encoding="utf-8"))
                         rid = str(d.get("run_id") or jp.stem)
@@ -1119,36 +1188,53 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                         pass
 
             job_entries.sort(key=lambda x: (0 if x[1].get("status") in active_states else 1, -float(x[1].get("updated_at") or 0)))
-            labels = []
-            by_label: dict[str, str] = {}
-            by_id: dict[str, tuple[dict[str, Any], Path, str]] = {}
-            seen_labels: dict[str, int] = {}
+            by_id: dict[str, tuple[dict[str, Any], Path]] = {}
+            wanted_ids: list[str] = []
             for rid, d, lp in job_entries:
-                st = str(d.get("status", "idle")).capitalize()
+                by_id[rid] = (d, lp)
+                wanted_ids.append(rid)
+            log_state["jobs_by_id"] = by_id
+
+            # Update left sidebar tree without losing selection or causing flicker
+            existing_ids = list(jobs_tree.get_children())
+            if existing_ids != wanted_ids:
+                for item in existing_ids:
+                    jobs_tree.delete(item)
+                for rid in wanted_ids:
+                    jobs_tree.insert("", "end", iid=rid, values=("", "", ""))
+
+            state_tag_map = {
+                "rendering": ("Rendering", "active"),
+                "uploading": ("Uploading", "busy"),
+                "provisioning": ("Starting", "busy"),
+                "preparing": ("Preparing", "busy"),
+                "done": ("Done", "done"),
+                "error": ("Error", "error"),
+                "stopped": ("Stopped", "stopped"),
+            }
+            for rid in wanted_ids:
+                d, _ = by_id[rid]
                 jname = d.get("job_name") or Path(d.get("blend") or rid).name
                 done_f = int(d.get("done_frames") or 0)
                 tot_f = int(d.get("total_frames") or 0)
-                gpu = d.get("gpu") or "?"
-                base_lbl = f"{jname}  ({done_f}/{tot_f} · {gpu} · {st})"
-                cnt = seen_labels.get(base_lbl, 0) + 1
-                seen_labels[base_lbl] = cnt
-                lbl = base_lbl if cnt == 1 else f"{base_lbl} #{cnt}"
-                labels.append(lbl)
-                by_label[lbl] = rid
-                by_id[rid] = (d, lp, lbl)
+                st_label, st_tag = state_tag_map.get(str(d.get("status", "idle")), ("Idle", "stopped"))
+                jobs_tree.item(rid, values=(jname, f"{done_f}/{tot_f}", st_label), tags=(st_tag,))
 
-            log_state["jobs_by_label"] = by_label
-            log_state["jobs_by_id"] = by_id
-
-            if labels:
-                job_combo.configure(values=labels)
+            if wanted_ids:
                 sel_rid = log_state["selected_run_id"]
                 if not sel_rid or sel_rid not in by_id:
-                    sel_rid = job_entries[0][0]
+                    sel_rid = wanted_ids[0]
                     log_state["selected_run_id"] = sel_rid
-                data, log_path, cur_lbl = by_id[sel_rid]
-                if job_sel_var.get() != cur_lbl:
-                    job_sel_var.set(cur_lbl)
+                if jobs_tree.selection() != (sel_rid,):
+                    jobs_tree.selection_set(sel_rid)
+                data, log_path = by_id[sel_rid]
+
+                jname = data.get("job_name") or Path(data.get("blend") or sel_rid).name
+                gpu = data.get("gpu") or "?"
+                sess = data.get("session") or ""
+                par = max(1, int(data.get("par") or 1))
+                lbl_job_title.configure(text=jname)
+                lbl_job_meta.configure(text=f"{gpu} · {par}x · {sess}" if sess else f"{gpu} · {par}x")
 
                 st = str(data.get("status", "idle"))
                 badge_map = {
@@ -1169,12 +1255,11 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                 pbar.configure(value=min(100.0, pct))
 
                 avg_s = float(data.get("avg_frame_sec") or 0.0)
-                par = max(1, int(data.get("par") or 1))
                 rem = max(0, total - done)
                 eta = _fmt_eta((rem * avg_s) / par) if (avg_s > 0 and rem > 0 and st == "rendering") else ""
                 err_txt = data.get("error") or ""
                 if err_txt:
-                    lbl_job_progress.configure(text=err_txt[:110], fg=RED)
+                    lbl_job_progress.configure(text=err_txt[:95], fg=RED)
                 else:
                     parts = [f"{done} / {total} frames ({pct:.0f}%)"]
                     if eta:
@@ -1194,7 +1279,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                     try:
                         img = tk.PhotoImage(file=fp)
                         w_i, h_i = img.width(), img.height()
-                        scale = max(1, int(max(w_i / 276, h_i / 210)))
+                        scale = max(1, int(max(w_i / 245, h_i / 200)))
                         if scale > 1:
                             img = img.subsample(scale, scale)
                         log_state["thumb_img"] = img
@@ -1378,8 +1463,10 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         lbl_preview_img.configure(image="", text="Latest frame")
         lbl_preview_cap.configure(text="")
         clear_log_box()
-        job_combo.configure(values=[])
-        job_sel_var.set("No recent renders")
+        for item in jobs_tree.get_children():
+            jobs_tree.delete(item)
+        lbl_job_title.configure(text="No job selected")
+        lbl_job_meta.configure(text="")
         lbl_job_badge.configure(text="Idle", fg=MUTED, bg=CONTROL)
         lbl_job_progress.configure(text="Ready to render", fg=TEXT)
         pbar.configure(value=0)
