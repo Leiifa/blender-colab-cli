@@ -2,7 +2,10 @@
 
 Use **Google Colab GPUs (T4, L4, A100, H100)** directly from your terminal or AI coding agent — **no browser tab, no Google Drive mount, and no Drive sync required** — complete with:
 
-1. **Multi-Account Switcher GUI & CLI (`colab_accounts.py` / `Colab_Accounts.bat`)** — works for **any** GPU-heavy `google-colab-cli` workload (PyTorch, Whisper, video upscaling/encoding, diffusion, data processing, or Blender).
+1. **Colab CLI Studio GUI (`colab_accounts.py` / `Colab_Accounts.bat`)** — zero-CMD desktop app with 3 tabs:
+   - **Accounts & CUs:** manage multiple Google accounts in your OS keyring, view live Compute Unit balances/burn rates, switch accounts in 1 click, and stop active VMs.
+   - **Live Monitor:** auto-refreshing GPU VM status, real-time render progress bar + ETA, latest rendered PNG frame thumbnail preview, and live scrolling render log — **automatically monitors renders started by AI agents or terminals too** (via `~/.config/colab-cli/active_render.json`).
+   - **Launch Render:** pick a `.blend` or `jobs.json`, GPU, frame range, and parallel workers to dry-run or render without ever opening CMD.
 2. **Headless Blender Cloud Renderer (`colab_render.py`, `prepare_shot.py`, `cloud_render.py`)** — bundles local scenes/assets, renders with parallel GPU workers, streams finished frames directly to disk, and auto-stops the VM.
 3. **AI-Agent Friendly (`AGENTS.md`, `CLAUDE.md`, `SKILL.md`, `--json` output)** — ready for Claude Code, Codex, Gemini, Cursor, and other coding agents to safely offload heavy GPU jobs without leaving idle VMs running.
 

@@ -53,6 +53,87 @@ CHUNK_BYTES = 16 * 1024 * 1024  # 16 MiB chunks keep base64 JSON PUTs well below
 
 FRAME_LINE_RE = re.compile(r"(?:\[\d+\]\s+)?FRAME\s+(\S+)\s+([\d.]+)s(?:\s+\|\s+(.+))?")
 BLENDER_VER_RE = re.compile(r"Blender\s+(\d+\.\d+\.\d+)")
+CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+MONITOR_DIR = Path.home() / ".config" / "colab-cli"
+ACTIVE_RENDER_JSON = MONITOR_DIR / "active_render.json"
+ACTIVE_RENDER_LOG = MONITOR_DIR / "active_render.log"
+
+
+class _RenderTelemetry:
+    """Writes live render progress & logs to ~/.config/colab-cli/ so the GUI monitors CLI/agent runs."""
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.run_id = f"{int(time.time())}_{os.getpid()}"
+        self.state: dict = {
+            "run_id": self.run_id,
+            "pid": os.getpid(),
+            "status": "starting",
+            "job_name": "",
+            "job_index": 0,
+            "job_count": 0,
+            "blend": "",
+            "out_dir": "",
+            "gpu": "",
+            "session": "",
+            "par": 1,
+            "total_frames": 0,
+            "done_frames": 0,
+            "rendered_this_run": 0,
+            "last_frame": "",
+            "last_frame_sec": 0.0,
+            "avg_frame_sec": 0.0,
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "error": "",
+        }
+        self._frame_times: list[float] = []
+        if self.enabled:
+            MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                ACTIVE_RENDER_LOG.write_text("", encoding="utf-8")
+            except OSError:
+                pass
+            self._flush_json()
+
+    def _flush_json(self) -> None:
+        if not self.enabled:
+            return
+        self.state["updated_at"] = time.time()
+        try:
+            tmp = ACTIVE_RENDER_JSON.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+            os.replace(tmp, ACTIVE_RENDER_JSON)
+        except OSError:
+            pass
+
+    def update(self, **kwargs) -> None:
+        self.state.update(kwargs)
+        self._flush_json()
+
+    def log(self, line: str) -> None:
+        print(line, flush=True)
+        if not self.enabled:
+            return
+        try:
+            with open(ACTIVE_RENDER_LOG, "a", encoding="utf-8", errors="replace") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+    def record_frame(self, frame_label: str, sec: float, done_frames: int, frame_path: str = "") -> None:
+        self._frame_times.append(sec)
+        if len(self._frame_times) > 20:
+            self._frame_times = self._frame_times[-20:]
+        self.state["done_frames"] = done_frames
+        self.state["rendered_this_run"] = self.state.get("rendered_this_run", 0) + 1
+        self.state["last_frame"] = frame_label
+        self.state["last_frame_sec"] = sec
+        self.state["avg_frame_sec"] = sum(self._frame_times) / len(self._frame_times)
+        if frame_path:
+            self.state["last_frame_path"] = frame_path
+        self._flush_json()
 
 
 def _find_colab() -> str:
@@ -137,6 +218,7 @@ def _run_colab(args: list[str], *, check: bool = True, capture: bool = False) ->
         encoding="utf-8",
         errors="replace",
         capture_output=capture,
+        creationflags=CREATION_FLAGS,
     )
 
 
@@ -411,6 +493,8 @@ def _run_remote_job(
     extras: list[str],
     missing: list[int],
     par: int,
+    telemetry: Optional[_RenderTelemetry] = None,
+    fmt: str = "png",
 ) -> tuple[int, int]:
     """Execute Blender render job on Colab and stream completed frames back locally."""
     local_out_dir.mkdir(parents=True, exist_ok=True)
@@ -473,6 +557,9 @@ def _run_remote_job(
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     rc = 0
 
+    total_frames = f1 - f0 + 1
+    done_so_far = total_frames - len(missing)
+
     try:
         proc = subprocess.Popen(
             [_find_colab(), "exec", "-s", session, "--timeout", "0", "-f", driver_path],
@@ -483,24 +570,40 @@ def _run_remote_job(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=CREATION_FLAGS,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
             s = line.rstrip()
-            print(s, flush=True)
+            if telemetry:
+                telemetry.log(s)
+            else:
+                print(s, flush=True)
             m = FRAME_LINE_RE.search(s)
-            if m and m.group(3):
-                for fname in [x.strip() for x in m.group(3).split(",") if x.strip()]:
-                    if fname not in downloaded_files:
-                        downloaded_files.add(fname)
-                        futures.append(
-                            pool.submit(
-                                _download_one_file,
-                                session,
-                                f"{remote_out}/{fname}",
-                                local_out_dir / fname,
+            if m:
+                done_so_far = min(total_frames, done_so_far + 1)
+                primary_local = ""
+                if m.group(3):
+                    fnames = [x.strip() for x in m.group(3).split(",") if x.strip()]
+                    for fn in fnames:
+                        if fn.lower().endswith(".png") and not fn.lower().endswith("_mist.png"):
+                            primary_local = str(local_out_dir / fn)
+                    for fname in fnames:
+                        if fname not in downloaded_files:
+                            downloaded_files.add(fname)
+                            futures.append(
+                                pool.submit(
+                                    _download_one_file,
+                                    session,
+                                    f"{remote_out}/{fname}",
+                                    local_out_dir / fname,
+                                )
                             )
-                        )
+                if telemetry:
+                    try:
+                        telemetry.record_frame(m.group(1), float(m.group(2)), done_so_far, primary_local)
+                    except ValueError:
+                        pass
         rc = proc.wait()
     finally:
         for fut in futures:
@@ -557,11 +660,30 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
     blender_exe = None if args.skip_prepare else _find_blender(args.blender)
     blender_ver = _detect_blender_version(args.blender_version, blender_exe)
 
+    telemetry = _RenderTelemetry(enabled=not args.dry_run)
+    telemetry.update(
+        status="preparing",
+        job_count=len(planned),
+        gpu=args.gpu.upper(),
+        session=args.session,
+        par=args.par,
+    )
+
     with tempfile.TemporaryDirectory(prefix="blender_colab_stage_") as tmp_stage:
         stage_root = Path(tmp_stage)
         staged = []
-        for item in planned:
+        for idx, item in enumerate(planned, 1):
             j, blend_path, out_dir, prefix, f0, f1, samples, extras, fmt, missing = item
+            telemetry.update(
+                status="preparing",
+                job_index=idx,
+                job_name=j["name"],
+                blend=str(blend_path),
+                out_dir=str(out_dir),
+                total_frames=f1 - f0 + 1,
+                done_frames=(f1 - f0 + 1) - len(missing),
+            )
+            telemetry.log(f"[prepare] Staging {j['name']} ({blend_path.name})...")
             zip_path, shot_name = _stage_and_zip_shot(
                 blend_path, stage_root, project_root, blender_exe, skip_prepare=args.skip_prepare, dry=args.dry_run
             )
@@ -574,15 +696,29 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
         created_session = False
         overall_rc = 0
         try:
+            telemetry.update(status="provisioning")
+            telemetry.log(f"[colab] Provisioning session '{args.session}' (gpu={args.gpu.upper()})...")
             created_session = _ensure_session(args.session, args.gpu, args.high_mem)
+            telemetry.log(f"[colab] Ensuring Blender {blender_ver} on '{args.session}'...")
             _ensure_remote_blender(args.session, blender_ver)
 
             for idx, (j, zip_path, shot_name, out_dir, prefix, f0, f1, samples, extras, fmt, missing) in enumerate(staged, 1):
                 assert zip_path is not None
-                print(f"\n=== [{idx}/{len(staged)}] {j['name']} ({len(missing)} missing frame(s)) ===")
+                total = f1 - f0 + 1
+                telemetry.update(
+                    status="uploading",
+                    job_index=idx,
+                    job_name=j["name"],
+                    blend=shot_name,
+                    out_dir=str(out_dir),
+                    total_frames=total,
+                    done_frames=total - len(missing),
+                )
+                telemetry.log(f"\n=== [{idx}/{len(staged)}] {j['name']} ({len(missing)} missing frame(s)) ===")
                 _upload_bundle(args.session, zip_path)
                 job_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", j["out"]).strip("_") or f"job_{idx}"
                 t0 = time.time()
+                telemetry.update(status="rendering")
                 dl_count, rc = _run_remote_job(
                     args.session,
                     shot_name,
@@ -595,24 +731,33 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
                     extras,
                     missing,
                     args.par,
+                    telemetry=telemetry,
+                    fmt=fmt,
                 )
                 rem = _missing_frames(out_dir, prefix, f0, f1, fmt)
-                total = f1 - f0 + 1
-                print(
+                telemetry.update(done_frames=total - len(rem))
+                telemetry.log(
                     f"[summary] {j['name']}: {total - len(rem)}/{total} present locally "
                     f"(downloaded {dl_count} file(s) in {time.time() - t0:.1f}s, rc={rc})"
                 )
                 if rc != 0 or rem:
                     overall_rc = rc or 1
         except KeyboardInterrupt:
-            print("\n[colab] Interrupted by user.", file=sys.stderr)
+            telemetry.log("\n[colab] Interrupted by user.")
+            telemetry.update(status="stopped", error="Interrupted by user")
             overall_rc = 130
+        except Exception as e:
+            telemetry.log(f"[error] {e}")
+            telemetry.update(status="error", error=str(e))
+            raise
         finally:
             if not args.keep and (created_session or args.stop_existing):
-                print(f"[colab] Stopping session '{args.session}' to stop compute billing...")
+                telemetry.log(f"[colab] Stopping session '{args.session}' to stop compute billing...")
                 _run_colab(["stop", "-s", args.session], check=False)
             elif args.keep:
-                print(f"[colab] Keeping session '{args.session}' alive (--keep). Stop later with: python colab_render.py stop -s {args.session}")
+                telemetry.log(f"[colab] Keeping session '{args.session}' alive (--keep). Stop later with: python colab_render.py stop -s {args.session}")
+            if telemetry.state.get("status") not in ("stopped", "error"):
+                telemetry.update(status="done" if overall_rc == 0 else "error")
 
         return overall_rc
 
