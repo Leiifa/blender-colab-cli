@@ -1,15 +1,16 @@
-"""Colab CLI Studio — Account Switcher, Live GPU/Render Monitor & Launcher GUI + CLI.
+"""Colab Render — Account switcher, live GPU/render monitor, and Blender launcher.
 
-Works natively without opening CMD windows (via pythonw.exe / CREATE_NO_WINDOW).
-Monitors BOTH GUI-launched renders AND renders started by AI agents or terminals
-(by reading live telemetry from ~/.config/colab-cli/active_render.json & .log).
+Runs windowless on Windows (pythonw.exe) and monitors renders launched from the GUI,
+terminal, or AI agents via ~/.config/colab-cli/jobs/.
 
-Usage:
-  python colab_accounts.py                     # Launch the GUI
-  python colab_accounts.py list [--json]       # Print saved accounts & live CU balances
-  python colab_accounts.py active [--json]     # Show active account email & CU balance
-  python colab_accounts.py switch EMAIL        # Switch active account from CLI
-  python colab_accounts.py stop-vms [EMAIL]    # Stop all running Colab VMs on account
+CLI usage:
+  python colab_accounts.py                     # Open GUI
+  python colab_accounts.py monitor             # Open GUI detached on Monitor tab
+  python colab_accounts.py list [--json]       # List saved accounts & live balances
+  python colab_accounts.py active [--json]     # Show active account & balance
+  python colab_accounts.py vms [--json]        # List running VMs across all accounts
+  python colab_accounts.py switch EMAIL        # Switch active account
+  python colab_accounts.py stop-vms [EMAIL]    # Stop all running VMs on an account
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" e
 
 
 # ---------------------------------------------------------------------------
-# Auto-relaunch inside google-colab-cli's uv tool venv if run with system python
+# Auto-relaunch inside google-colab-cli's uv venv when invoked with system python
 # ---------------------------------------------------------------------------
 def _find_uv_colab_python(*, windowless: bool = False) -> Optional[Path]:
     exe_name = "pythonw.exe" if (windowless and os.name == "nt") else ("python.exe" if os.name == "nt" else "python")
@@ -58,9 +59,7 @@ except ImportError:
     uv_py = _find_uv_colab_python(windowless=False)
     if uv_py and Path(sys.executable).resolve() != uv_py.resolve():
         raise SystemExit(subprocess.call([str(uv_py), str(Path(__file__).resolve()), *sys.argv[1:]]))
-    raise SystemExit(
-        "ERROR: google-colab-cli environment not found. Run: uv tool install google-colab-cli"
-    )
+    raise SystemExit("google-colab-cli is not installed. Run: uv tool install google-colab-cli")
 
 from importlib import resources
 import keyring
@@ -96,15 +95,13 @@ def _is_pid_alive(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
     if os.name == "nt":
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
         if not handle:
             return False
         try:
             code = ctypes.c_ulong()
             if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return code.value == STILL_ACTIVE
+                return code.value == 259  # STILL_ACTIVE
             return False
         finally:
             ctypes.windll.kernel32.CloseHandle(handle)
@@ -183,7 +180,7 @@ def _fetch_email_for_credentials(creds: Credentials) -> str:
         info = json.loads(resp.read().decode("utf-8"))
     email = info.get("email")
     if not email:
-        raise RuntimeError("Token did not return an email address (missing userinfo.email scope).")
+        raise RuntimeError("Could not read account email from Google token.")
     return email.lower()
 
 
@@ -213,12 +210,11 @@ def _query_account_live_status(token_json: str) -> dict[str, Any]:
             for a in assignments
         ],
         "token_json": creds.to_json() if refreshed else token_json,
-        "checked_at": datetime.now().strftime("%H:%M:%S"),
+        "checked_at": datetime.now().strftime("%H:%M"),
     }
 
 
 def _endpoint_session_map(email: str, *, is_active: bool) -> dict[str, str]:
-    """Map VM endpoint -> local CLI session name for an account."""
     ep_map: dict[str, str] = {}
     paths = [SESSIONS_PATH] if is_active else []
     paths.append(PROFILES_DIR / f"{_safe_slug(email)}_sessions.json")
@@ -237,7 +233,6 @@ def _endpoint_session_map(email: str, *, is_active: bool) -> dict[str, str]:
 
 
 def stop_one_vm(email: str, endpoint: str) -> None:
-    """Unassign a single Colab VM endpoint on any saved account."""
     email = email.lower().strip()
     token_json = _get_account_token_json(email)
     if not token_json:
@@ -253,7 +248,6 @@ def stop_one_vm(email: str, endpoint: str) -> None:
     client = Client(Prod(), AuthorizedSession(creds))
     client.unassign(endpoint)
 
-    # Prune this endpoint from local session files if present
     idx = _load_index()
     paths = [PROFILES_DIR / f"{_safe_slug(email)}_sessions.json"]
     if idx.get("active") == email:
@@ -365,7 +359,7 @@ def switch_active_account(email: str) -> str:
 
     tok = _get_account_token_json(email)
     if not tok:
-        raise RuntimeError(f"Credential for '{email}' is missing from your OS keyring. Re-add the account.")
+        raise RuntimeError(f"Saved sign-in for '{email}' is missing. Please add the account again.")
 
     old_active = idx.get("active")
     if old_active and old_active != email:
@@ -439,15 +433,15 @@ def finish_oauth_flow(flow: InstalledAppFlow, code: str, *, activate: bool = Tru
 
 def _fmt_eta(seconds: float) -> str:
     if seconds <= 0:
-        return "—"
+        return ""
     s = int(seconds)
     m, sec = divmod(s, 60)
     h, m = divmod(m, 60)
     if h:
-        return f"~{h}h {m:02d}m"
+        return f"~{h}h {m:02d}m left"
     if m:
-        return f"~{m}m {sec:02d}s"
-    return f"~{sec}s"
+        return f"~{m}m {sec:02d}s left"
+    return f"~{sec}s left"
 
 
 def _open_path_in_explorer(path: str) -> None:
@@ -462,23 +456,9 @@ def _open_path_in_explorer(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tkinter GUI (Accounts + Live Monitor + Launch Render)
+# Single-instance window detection (Windows HWND-aware)
 # ---------------------------------------------------------------------------
-BG = "#141417"
-CARD = "#1e1e24"
-CARD_ALT = "#26262e"
-BORDER = "#34343f"
-TEXT = "#f4f4f5"
-MUTED = "#a1a1aa"
-ACCENT = "#3b82f6"
-ACCENT_HOVER = "#2563eb"
-GREEN = "#22c55e"
-AMBER = "#f59e0b"
-RED = "#ef4444"
-
-
 def _find_gui_hwnd(pid: int) -> Optional[int]:
-    """On Windows, return a top-level HWND belonging to `pid` (if any)."""
     if os.name != "nt" or not pid or pid <= 0:
         return None
     try:
@@ -507,9 +487,8 @@ def _focus_hwnd(hwnd: int) -> None:
         return
     try:
         user32 = ctypes.windll.user32
-        SW_RESTORE = 9
         if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, SW_RESTORE)
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
@@ -531,10 +510,8 @@ def is_gui_running(*, cleanup_zombie: bool = False) -> bool:
             GUI_PID_PATH.unlink(missing_ok=True)
         return False
     if os.name == "nt":
-        # A pythonw.exe with no visible window after startup is a zombie; clean it up if requested.
         if _find_gui_hwnd(pid) is not None:
             return True
-        # Give a freshly spawned process up to 5 seconds to create its window before treating as zombie.
         try:
             age = time.time() - GUI_PID_PATH.stat().st_mtime
         except OSError:
@@ -555,7 +532,6 @@ def is_gui_running(*, cleanup_zombie: bool = False) -> bool:
 
 
 def ensure_gui_open(*, tab: str = "monitor", focus_if_open: bool = False) -> bool:
-    """Spawn the Studio GUI detached (windowless) if not already running. Returns True if launched."""
     if os.environ.get("COLAB_NO_GUI", "").strip().lower() in ("1", "true", "yes"):
         return False
     if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -585,8 +561,6 @@ def ensure_gui_open(*, tab: str = "monitor", focus_if_open: bool = False) -> boo
         close_fds=True,
     )
     if os.name == "nt":
-        # Note: Do NOT pass CREATE_NO_WINDOW or DETACHED_PROCESS to pythonw.exe — pythonw is already
-        # a GUI-subsystem binary (no CMD window) and needs SW_SHOWNORMAL to display its Tk window cleanly.
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 1  # SW_SHOWNORMAL
@@ -601,7 +575,26 @@ def ensure_gui_open(*, tab: str = "monitor", focus_if_open: bool = False) -> boo
         return False
 
 
-def launch_gui(*, initial_tab: str = "accounts") -> int:
+# ---------------------------------------------------------------------------
+# GUI — Clean, native-feeling dark theme
+# ---------------------------------------------------------------------------
+BG = "#111215"
+SURFACE = "#181a1f"
+CONTROL = "#22252c"
+HOVER = "#2c303a"
+BORDER = "#252830"
+TEXT = "#eceef2"
+MUTED = "#8b91a0"
+ACCENT = "#3b82f6"
+ACCENT_HOVER = "#2563eb"
+GREEN = "#34d399"
+AMBER = "#fbbf24"
+RED = "#f87171"
+DANGER_BG = "#2e1a1d"
+DANGER_HOVER = "#432227"
+
+
+def launch_gui(*, initial_tab: str = "monitor") -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -619,9 +612,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         pass
 
     root = tk.Tk()
-    root.title("Colab CLI Studio — Accounts, Live Monitor & Blender Render")
-    root.geometry("920x660")
-    root.minsize(820, 580)
+    root.title("Colab Render")
+    root.geometry("940x650")
+    root.minsize(820, 560)
     root.configure(bg=BG)
 
     style = ttk.Style(root)
@@ -631,59 +624,60 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         pass
 
     style.configure(
-        "Dark.Treeview",
-        background=CARD,
+        "Clean.Treeview",
+        background=SURFACE,
         foreground=TEXT,
-        fieldbackground=CARD,
-        bordercolor=BORDER,
+        fieldbackground=SURFACE,
         borderwidth=0,
         rowheight=32,
-        font=("Segoe UI", 10),
+        font=("Segoe UI", 9),
     )
     style.configure(
-        "Dark.Treeview.Heading",
-        background=CARD_ALT,
+        "Clean.Treeview.Heading",
+        background=SURFACE,
         foreground=MUTED,
         borderwidth=0,
-        font=("Segoe UI", 9, "bold"),
+        relief="flat",
+        font=("Segoe UI", 9),
         padding=(8, 6),
     )
-    style.map("Dark.Treeview", background=[("selected", "#2a3954")], foreground=[("selected", TEXT)])
-    style.map("Dark.Treeview.Heading", background=[("active", CARD_ALT)])
+    style.map("Clean.Treeview", background=[("selected", "#233047")], foreground=[("selected", TEXT)])
+    style.map("Clean.Treeview.Heading", background=[("active", SURFACE)])
 
-    style.configure("Dark.TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+    style.configure("Clean.TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
     style.configure(
-        "Dark.TNotebook.Tab",
-        background=CARD,
+        "Clean.TNotebook.Tab",
+        background=BG,
         foreground=MUTED,
         padding=(16, 8),
         font=("Segoe UI", 9, "bold"),
         borderwidth=0,
     )
     style.map(
-        "Dark.TNotebook.Tab",
-        background=[("selected", CARD_ALT), ("active", "#2c2c36")],
+        "Clean.TNotebook.Tab",
+        background=[("selected", SURFACE), ("active", "#1c1f26")],
         foreground=[("selected", TEXT), ("active", TEXT)],
     )
     style.configure(
-        "Render.Horizontal.TProgressbar",
-        troughcolor=CARD_ALT,
+        "Clean.Horizontal.TProgressbar",
+        troughcolor=CONTROL,
         background=ACCENT,
-        bordercolor=BORDER,
+        bordercolor=CONTROL,
         lightcolor=ACCENT,
         darkcolor=ACCENT,
-        thickness=12,
+        thickness=8,
     )
     style.configure(
-        "Dark.TCombobox",
-        fieldbackground=CARD,
-        background=CARD_ALT,
+        "Clean.TCombobox",
+        fieldbackground=CONTROL,
+        background=CONTROL,
         foreground=TEXT,
-        arrowcolor=TEXT,
+        arrowcolor=MUTED,
         bordercolor=BORDER,
+        padding=4,
     )
 
-    def make_btn(parent, text, command, *, bg=CARD_ALT, fg=TEXT, hover=BORDER, padx=12, pady=6, font_size=9, bold=False):
+    def make_btn(parent, text, command, *, bg=CONTROL, fg=TEXT, hover=HOVER, padx=12, pady=5, font_size=9, bold=False):
         weight = "bold" if bold else "normal"
         b = tk.Button(
             parent,
@@ -693,6 +687,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             fg=fg,
             activebackground=hover,
             activeforeground=fg,
+            disabledforeground="#555b69",
             relief="flat",
             bd=0,
             cursor="hand2",
@@ -706,7 +701,6 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 
     live_cache: dict[str, dict[str, Any]] = {}
     busy = {"refresh": False}
-    auto_refresh_var = tk.BooleanVar(value=True)
     log_state: dict[str, Any] = {
         "selected_run_id": None,
         "tailed_run_id": None,
@@ -719,184 +713,131 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
     }
     gui_procs: list[subprocess.Popen] = []
 
-    # --- Status bar packed FIRST at bottom ---
-    status_var = tk.StringVar(value="Ready.")
-    status_bar = tk.Label(root, textvariable=status_var, bg="#0f0f12", fg=MUTED, anchor="w", padx=14, pady=6, font=("Segoe UI", 9))
+    # --- Subtle bottom status strip (packed first so nothing ever clips) ---
+    status_var = tk.StringVar(value="")
+    status_bar = tk.Label(root, textvariable=status_var, bg=BG, fg=MUTED, anchor="w", padx=18, pady=6, font=("Segoe UI", 8))
     status_bar.pack(fill="x", side="bottom")
 
-    # --- Top Header ---
-    header = tk.Frame(root, bg=BG)
-    header.pack(fill="x", padx=20, pady=(14, 8))
+    # --- Compact single-row Top Bar ---
+    topbar = tk.Frame(root, bg=SURFACE)
+    topbar.pack(fill="x")
+    tb_in = tk.Frame(topbar, bg=SURFACE)
+    tb_in.pack(fill="x", padx=18, pady=10)
 
-    h_top = tk.Frame(header, bg=BG)
-    h_top.pack(fill="x")
-    h_right = tk.Frame(h_top, bg=BG)
-    h_right.pack(side="right")
-    tk.Label(h_top, text="Colab CLI Studio", bg=BG, fg=TEXT, font=("Segoe UI", 15, "bold")).pack(side="left", anchor="w")
-    tk.Label(
-        header,
-        text="Zero-CMD GPU monitor, multi-account Compute Unit switcher, and Blender cloud render launcher.",
-        bg=BG,
-        fg=MUTED,
-        font=("Segoe UI", 9),
-    ).pack(anchor="w", pady=(2, 0))
+    tk.Label(tb_in, text="Colab Render", bg=SURFACE, fg=TEXT, font=("Segoe UI", 12, "bold")).pack(side="left")
 
-    # --- Always-visible Active Account Strip ---
-    active_card = tk.Frame(root, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    active_card.pack(fill="x", padx=20, pady=(0, 10))
+    # Clickable active-account summary right in the top bar
+    pill = tk.Frame(tb_in, bg=CONTROL, cursor="hand2")
+    pill.pack(side="left", padx=(16, 0))
+    lbl_top_account = tk.Label(pill, text="Not signed in", bg=CONTROL, fg=AMBER, font=("Segoe UI", 9), padx=10, pady=4, cursor="hand2")
+    lbl_top_account.pack(side="left")
+    lbl_top_cu = tk.Label(pill, text="", bg=CONTROL, fg=GREEN, font=("Segoe UI", 9, "bold"), padx=0, pady=4, cursor="hand2")
+    lbl_top_cu.pack(side="left", padx=(0, 10))
+    lbl_top_vm = tk.Label(pill, text="", bg=CONTROL, fg=MUTED, font=("Segoe UI", 9), padx=0, pady=4, cursor="hand2")
+    lbl_top_vm.pack(side="left", padx=(0, 10))
 
-    ac_inner = tk.Frame(active_card, bg=CARD)
-    ac_inner.pack(fill="x", padx=16, pady=10)
+    tb_right = tk.Frame(tb_in, bg=SURFACE)
+    tb_right.pack(side="right")
 
-    ac_left = tk.Frame(ac_inner, bg=CARD)
-    ac_left.pack(side="left", fill="x", expand=True)
-    ac_lbl_row = tk.Frame(ac_left, bg=CARD)
-    ac_lbl_row.pack(anchor="w")
-    tk.Label(ac_lbl_row, text="ACTIVE ACCOUNT", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-    lbl_checked = tk.Label(ac_lbl_row, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 8))
-    lbl_checked.pack(side="left", padx=(10, 0))
-    lbl_active_email = tk.Label(ac_left, text="Not signed in", bg=CARD, fg=TEXT, font=("Segoe UI", 12, "bold"))
-    lbl_active_email.pack(anchor="w", pady=(2, 0))
-    lbl_active_meta = tk.Label(ac_left, text="Click '+ Add Account' to connect a Google account.", bg=CARD, fg=MUTED, font=("Segoe UI", 9))
-    lbl_active_meta.pack(anchor="w")
+    # Hairline divider under top bar
+    tk.Frame(root, bg=BORDER, height=1).pack(fill="x")
 
-    ac_right = tk.Frame(ac_inner, bg=CARD)
-    ac_right.pack(side="right", padx=(12, 0))
-    lbl_cu_val = tk.Label(ac_right, text="— CU", bg=CARD, fg=GREEN, font=("Segoe UI", 16, "bold"))
-    lbl_cu_val.pack(anchor="e")
-    lbl_vm_val = tk.Label(ac_right, text="0 active VMs", bg=CARD, fg=MUTED, font=("Segoe UI", 9))
-    lbl_vm_val.pack(anchor="e")
+    # --- Tabs ---
+    nb = ttk.Notebook(root, style="Clean.TNotebook")
+    nb.pack(fill="both", expand=True, padx=18, pady=(12, 4))
 
-    # --- Notebook Tabs ---
-    nb = ttk.Notebook(root, style="Dark.TNotebook")
-    nb.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-
-    tab_accounts = tk.Frame(nb, bg=BG)
     tab_monitor = tk.Frame(nb, bg=BG)
     tab_render = tk.Frame(nb, bg=BG)
-    nb.add(tab_accounts, text="  Accounts & CUs  ")
-    nb.add(tab_monitor, text="  Live Monitor  ")
-    nb.add(tab_render, text="  Launch Render  ")
+    tab_accounts = tk.Frame(nb, bg=BG)
+    nb.add(tab_monitor, text="Monitor")
+    nb.add(tab_render, text="Render")
+    nb.add(tab_accounts, text="Accounts")
+
+    for w in (pill, lbl_top_account, lbl_top_cu, lbl_top_vm):
+        w.bind("<Button-1>", lambda _e: nb.select(tab_accounts))
 
     # =========================================================================
-    # TAB 1: ACCOUNTS & CUs
+    # TAB 1: MONITOR
     # =========================================================================
-    acc_actions = tk.Frame(tab_accounts, bg=BG)
-    acc_actions.pack(fill="x", side="bottom", pady=(8, 4))
+    # Bottom VM strip packed FIRST so main log/preview always gets remaining space
+    vm_section = tk.Frame(tab_monitor, bg=SURFACE)
+    vm_section.pack(fill="x", side="bottom", pady=(8, 0))
 
-    sec_hdr = tk.Frame(tab_accounts, bg=BG)
-    sec_hdr.pack(fill="x", pady=(10, 6))
-    tk.Label(sec_hdr, text="SAVED ACCOUNTS (double-click to switch)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-
-    tree_wrap = tk.Frame(tab_accounts, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    tree_wrap.pack(fill="both", expand=True)
-
-    cols = ("status", "email", "balance", "rate", "vms")
-    tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", style="Dark.Treeview", selectmode="browse", height=5)
-    tree.heading("status", text="Status")
-    tree.heading("email", text="Google Account")
-    tree.heading("balance", text="Compute Units")
-    tree.heading("rate", text="Burn Rate")
-    tree.heading("vms", text="Active VMs")
-    tree.column("status", width=95, anchor="center", stretch=False)
-    tree.column("email", width=310, anchor="w", stretch=True)
-    tree.column("balance", width=125, anchor="e", stretch=False)
-    tree.column("rate", width=95, anchor="e", stretch=False)
-    tree.column("vms", width=95, anchor="center", stretch=False)
-    tree.pack(fill="both", expand=True, padx=1, pady=1)
-
-    # =========================================================================
-    # TAB 2: LIVE MONITOR (monitors ALL active VMs across accounts + multiple concurrent render jobs)
-    # =========================================================================
-    # 1) All Active Colab VMs table (across ALL saved accounts)
-    vm_hdr = tk.Frame(tab_monitor, bg=BG)
-    vm_hdr.pack(fill="x", pady=(8, 4))
-    tk.Label(vm_hdr, text="ACTIVE COLAB VMs (ALL SAVED ACCOUNTS)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-    lbl_total_vms = tk.Label(vm_hdr, text="0 running", bg=BG, fg=GREEN, font=("Segoe UI", 8, "bold"))
-    lbl_total_vms.pack(side="left", padx=(10, 0))
-    vm_hdr_btns = tk.Frame(vm_hdr, bg=BG)
+    vm_top = tk.Frame(vm_section, bg=SURFACE)
+    vm_top.pack(fill="x", padx=14, pady=(8, 4))
+    lbl_vm_hdr = tk.Label(vm_top, text="Running VMs", bg=SURFACE, fg=TEXT, font=("Segoe UI", 9, "bold"))
+    lbl_vm_hdr.pack(side="left")
+    lbl_total_vms = tk.Label(vm_top, text="None", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
+    lbl_total_vms.pack(side="left", padx=(8, 0))
+    vm_hdr_btns = tk.Frame(vm_top, bg=SURFACE)
     vm_hdr_btns.pack(side="right")
 
-    vm_tree_wrap = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    vm_tree_wrap.pack(fill="x", pady=(0, 8))
-    vm_cols = ("account", "session", "gpu", "shape", "endpoint", "rate")
-    vm_tree = ttk.Treeview(vm_tree_wrap, columns=vm_cols, show="headings", style="Dark.Treeview", selectmode="browse", height=3)
+    vm_cols = ("account", "session", "gpu", "rate")
+    vm_tree = ttk.Treeview(vm_section, columns=vm_cols, show="headings", style="Clean.Treeview", selectmode="browse", height=2)
     vm_tree.heading("account", text="Account")
     vm_tree.heading("session", text="Session")
     vm_tree.heading("gpu", text="GPU")
-    vm_tree.heading("shape", text="Shape")
-    vm_tree.heading("endpoint", text="Endpoint")
-    vm_tree.heading("rate", text="Acct Burn")
-    vm_tree.column("account", width=220, anchor="w", stretch=True)
-    vm_tree.column("session", width=130, anchor="w", stretch=False)
-    vm_tree.column("gpu", width=70, anchor="center", stretch=False)
-    vm_tree.column("shape", width=85, anchor="center", stretch=False)
-    vm_tree.column("endpoint", width=170, anchor="w", stretch=False)
-    vm_tree.column("rate", width=85, anchor="e", stretch=False)
-    vm_tree.pack(fill="x", padx=1, pady=1)
+    vm_tree.heading("rate", text="Rate")
+    vm_tree.column("account", width=260, anchor="w", stretch=True)
+    vm_tree.column("session", width=180, anchor="w", stretch=False)
+    vm_tree.column("gpu", width=90, anchor="center", stretch=False)
+    vm_tree.column("rate", width=100, anchor="e", stretch=False)
+    vm_tree.pack(fill="x", padx=10, pady=(0, 8))
     vm_row_map: dict[str, tuple[str, str]] = {}
 
-    # 2) Render Job selector + live progress card
-    mon_top = tk.Frame(tab_monitor, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    mon_top.pack(fill="x", pady=(0, 8))
+    # Top Progress Card
+    mon_top = tk.Frame(tab_monitor, bg=SURFACE)
+    mon_top.pack(fill="x", pady=(10, 8))
 
-    mon_sel_row = tk.Frame(mon_top, bg=CARD)
-    mon_sel_row.pack(fill="x", padx=14, pady=(8, 4))
-    lbl_jobs_hdr = tk.Label(mon_sel_row, text="RENDER JOB:", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold"))
-    lbl_jobs_hdr.pack(side="left")
-    job_sel_var = tk.StringVar(value="No render jobs yet")
-    job_combo = ttk.Combobox(mon_sel_row, textvariable=job_sel_var, state="readonly", style="Dark.TCombobox", width=46)
-    job_combo.pack(side="left", padx=(8, 8), fill="x", expand=True)
-    btn_clear_hist = make_btn(mon_sel_row, "Clear History", lambda: do_clear_history(), pady=2, padx=8, font_size=8)
+    mon_row1 = tk.Frame(mon_top, bg=SURFACE)
+    mon_row1.pack(fill="x", padx=14, pady=(10, 6))
+    job_sel_var = tk.StringVar(value="No recent renders")
+    job_combo = ttk.Combobox(mon_row1, textvariable=job_sel_var, state="readonly", style="Clean.TCombobox", width=48)
+    job_combo.pack(side="left", fill="x", expand=True)
+    btn_clear_hist = make_btn(mon_row1, "Clear", lambda: do_clear_history(), bg=SURFACE, hover=CONTROL, fg=MUTED, padx=8, pady=3, font_size=8)
     btn_clear_hist.pack(side="right", padx=(6, 0))
-    lbl_job_badge = tk.Label(mon_sel_row, text="IDLE", bg=CARD_ALT, fg=MUTED, padx=8, pady=2, font=("Segoe UI", 8, "bold"))
-    lbl_job_badge.pack(side="right")
+    lbl_job_badge = tk.Label(mon_row1, text="Idle", bg=CONTROL, fg=MUTED, padx=10, pady=3, font=("Segoe UI", 8, "bold"))
+    lbl_job_badge.pack(side="right", padx=(10, 0))
 
-    lbl_job_detail = tk.Label(
-        mon_top,
-        text="Start a render from 'Launch Render' or via CLI/agent — multiple concurrent jobs appear in the dropdown above.",
-        bg=CARD,
-        fg=MUTED,
-        font=("Segoe UI", 9),
-    )
-    lbl_job_detail.pack(anchor="w", padx=14, pady=(0, 6))
+    pbar = ttk.Progressbar(mon_top, style="Clean.Horizontal.TProgressbar", mode="determinate", maximum=100, value=0)
+    pbar.pack(fill="x", padx=14, pady=(0, 8))
 
-    pbar = ttk.Progressbar(mon_top, style="Render.Horizontal.TProgressbar", mode="determinate", maximum=100, value=0)
-    pbar.pack(fill="x", padx=14, pady=(0, 6))
-
-    mon_bar_row = tk.Frame(mon_top, bg=CARD)
-    mon_bar_row.pack(fill="x", padx=14, pady=(0, 8))
-    lbl_job_progress = tk.Label(mon_bar_row, text="0 / 0 frames", bg=CARD, fg=MUTED, font=("Segoe UI", 9))
+    mon_row2 = tk.Frame(mon_top, bg=SURFACE)
+    mon_row2.pack(fill="x", padx=14, pady=(0, 10))
+    lbl_job_progress = tk.Label(mon_row2, text="Ready to render", bg=SURFACE, fg=TEXT, font=("Segoe UI", 9))
     lbl_job_progress.pack(side="left")
-    mon_btns = tk.Frame(mon_bar_row, bg=CARD)
+    mon_btns = tk.Frame(mon_row2, bg=SURFACE)
     mon_btns.pack(side="right")
 
-    # 3) Scrolling Live Render Log + Latest Frame Thumbnail Preview side-by-side
-    log_hdr = tk.Frame(tab_monitor, bg=BG)
-    log_hdr.pack(fill="x", pady=(0, 4))
-    tk.Label(log_hdr, text="LIVE RENDER LOG (SELECTED JOB)", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
-    tk.Label(log_hdr, text="LATEST FRAME PREVIEW", bg=BG, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="right", padx=(0, 8))
+    # Middle Split: Log (left) + Frame Preview (right)
+    mon_mid = tk.Frame(tab_monitor, bg=BG)
+    mon_mid.pack(fill="both", expand=True)
 
-    mon_bottom = tk.Frame(tab_monitor, bg=BG)
-    mon_bottom.pack(fill="both", expand=True, pady=(0, 4))
+    preview_card = tk.Frame(mon_mid, bg=SURFACE, width=300)
+    preview_card.pack(side="right", fill="y", padx=(10, 0))
+    preview_card.pack_propagate(False)
+    lbl_preview_img = tk.Label(
+        preview_card,
+        text="Latest frame",
+        bg=SURFACE,
+        fg=MUTED,
+        font=("Segoe UI", 9),
+        justify="center",
+        cursor="hand2",
+    )
+    lbl_preview_img.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+    lbl_preview_img.bind("<Button-1>", lambda _e: _open_path_in_explorer(log_state["thumb_path"]))
+    lbl_preview_cap = tk.Label(preview_card, text="", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8))
+    lbl_preview_cap.pack(side="bottom", pady=(0, 8))
 
-    preview_wrap = tk.Frame(mon_bottom, bg=CARD, highlightbackground=BORDER, highlightthickness=1, width=260)
-    preview_wrap.pack(side="right", fill="y", padx=(8, 0))
-    preview_wrap.pack_propagate(False)
-    lbl_preview_img = tk.Label(preview_wrap, text="Latest downloaded\nPNG frame appears\nhere automatically", bg=CARD, fg=MUTED, font=("Segoe UI", 9), justify="center")
-    lbl_preview_img.pack(fill="both", expand=True, padx=6, pady=6)
-    lbl_preview_cap = tk.Label(preview_wrap, text="", bg=CARD, fg=MUTED, font=("Consolas", 8))
-    lbl_preview_cap.pack(side="bottom", pady=(0, 6))
-
-    log_wrap = tk.Frame(mon_bottom, bg="#0d0d10", highlightbackground=BORDER, highlightthickness=1)
-    log_wrap.pack(side="left", fill="both", expand=True)
-
-    log_scroll = tk.Scrollbar(log_wrap)
+    log_card = tk.Frame(mon_mid, bg="#0d0e11")
+    log_card.pack(side="left", fill="both", expand=True)
+    log_scroll = tk.Scrollbar(log_card)
     log_scroll.pack(side="right", fill="y")
     log_text = tk.Text(
-        log_wrap,
-        bg="#0d0d10",
-        fg="#d4d4d8",
+        log_card,
+        bg="#0d0e11",
+        fg="#c9cdd6",
         insertbackground=TEXT,
         relief="flat",
         bd=0,
@@ -905,10 +846,10 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         yscrollcommand=log_scroll.set,
         state="disabled",
     )
-    log_text.pack(fill="both", expand=True, padx=8, pady=6)
+    log_text.pack(fill="both", expand=True, padx=10, pady=8)
     log_scroll.config(command=log_text.yview)
-    log_text.tag_configure("frame", foreground="#4ade80")
-    log_text.tag_configure("err", foreground="#f87171")
+    log_text.tag_configure("frame", foreground=GREEN)
+    log_text.tag_configure("err", foreground=RED)
     log_text.tag_configure("info", foreground="#60a5fa")
 
     def append_log_lines(text: str) -> None:
@@ -921,12 +862,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                 tag = "frame"
             elif "Error" in line or "Traceback" in line or "UNRESOLVED" in line or "[error]" in line:
                 tag = "err"
-            elif line.startswith(("[colab]", "[prepare]", "GPU:", "BLENDER:", "LAUNCH ")):
+            elif line.startswith(("[colab]", "[prepare]", "GPU:", "BLENDER:", "LAUNCH ", "UNPACKED:")):
                 tag = "info"
-            if tag:
-                log_text.insert("end", line, tag)
-            else:
-                log_text.insert("end", line)
+            log_text.insert("end", line, tag) if tag else log_text.insert("end", line)
         log_text.see("end")
         log_text.configure(state="disabled")
 
@@ -936,17 +874,16 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         log_text.configure(state="disabled")
 
     # =========================================================================
-    # TAB 3: LAUNCH RENDER (zero-CMD GUI launcher for Blender shots & queues)
+    # TAB 2: RENDER (clean form; auto-detects .blend vs .json queue)
     # =========================================================================
     ren_actions = tk.Frame(tab_render, bg=BG)
-    ren_actions.pack(fill="x", side="bottom", pady=(8, 4))
+    ren_actions.pack(fill="x", side="bottom", pady=(10, 2))
 
-    ren_card = tk.Frame(tab_render, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-    ren_card.pack(fill="both", expand=True, pady=(10, 4))
-    rf = tk.Frame(ren_card, bg=CARD)
-    rf.pack(fill="both", expand=True, padx=18, pady=14)
+    ren_card = tk.Frame(tab_render, bg=SURFACE)
+    ren_card.pack(fill="both", expand=True, pady=(10, 0))
+    rf = tk.Frame(ren_card, bg=SURFACE)
+    rf.pack(fill="x", padx=22, pady=18)
 
-    mode_var = tk.StringVar(value="shot")
     blend_var = tk.StringVar(value="")
     out_var = tk.StringVar(value="")
     prefix_var = tk.StringVar(value="f_")
@@ -955,14 +892,14 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
     samples_var = tk.StringVar(value="0")
     gpu_var = tk.StringVar(value="L4")
     par_var = tk.StringVar(value="3")
-    session_var = tk.StringVar(value="blender-render")
+    session_var = tk.StringVar(value="fetch-render")
     extras_var = tk.StringVar(value="")
     keep_var = tk.BooleanVar(value=False)
 
     def _entry(parent, var, width=None):
         kw: dict[str, Any] = dict(
             textvariable=var,
-            bg="#141418",
+            bg=BG,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
@@ -974,98 +911,105 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             kw["width"] = width
         return tk.Entry(parent, **kw)
 
-    r0 = tk.Frame(rf, bg=CARD)
-    r0.pack(fill="x", pady=(0, 10))
-    tk.Label(r0, text="Mode:", bg=CARD, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(side="left")
-    for val, lbl in (("shot", "Single .blend Shot"), ("queue", "Batch Queue (jobs.json)")):
-        tk.Radiobutton(
-            r0,
-            text=lbl,
-            variable=mode_var,
-            value=val,
-            bg=CARD,
-            fg=TEXT,
-            selectcolor=CARD_ALT,
-            activebackground=CARD,
-            activeforeground=TEXT,
-            font=("Segoe UI", 9),
-        ).pack(side="left", padx=(12, 0))
+    def _row(label: str):
+        r = tk.Frame(rf, bg=SURFACE)
+        r.pack(fill="x", pady=6)
+        tk.Label(r, text=label, bg=SURFACE, fg=MUTED, width=12, anchor="w", font=("Segoe UI", 9)).pack(side="left")
+        return r
 
-    r1 = tk.Frame(rf, bg=CARD)
-    r1.pack(fill="x", pady=(0, 8))
-    tk.Label(r1, text="Scene / Queue:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    _entry(r1, blend_var).pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 8))
+    r1 = _row("Scene file")
+    _entry(r1, blend_var).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8))
 
     def browse_input() -> None:
-        if mode_var.get() == "queue":
-            p = filedialog.askopenfilename(title="Select jobs.json", filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
-        else:
-            p = filedialog.askopenfilename(title="Select Blender scene", filetypes=[("Blender files", "*.blend"), ("All files", "*.*")])
+        p = filedialog.askopenfilename(
+            title="Select Blender scene or jobs.json",
+            filetypes=[("Blender or Queue", "*.blend *.json"), ("Blender files", "*.blend"), ("JSON queues", "*.json")],
+        )
         if p:
             blend_var.set(p)
-            if mode_var.get() == "shot" and not out_var.get().strip():
+            if p.lower().endswith(".blend") and not out_var.get().strip():
                 bp = Path(p)
                 out_var.set(str(bp.parent.parent / "comp" / bp.stem if bp.parent.name.lower() == "blender" else bp.parent / "renders" / bp.stem))
 
-    make_btn(r1, "Browse…", browse_input, pady=4).pack(side="right")
+    make_btn(r1, "Browse", browse_input, pady=5).pack(side="right")
 
-    r2 = tk.Frame(rf, bg=CARD)
-    r2.pack(fill="x", pady=(0, 10))
-    tk.Label(r2, text="Output Folder:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    _entry(r2, out_var).pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 8))
+    r2 = _row("Output folder")
+    _entry(r2, out_var).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8))
 
     def browse_out() -> None:
-        p = filedialog.askdirectory(title="Select output folder for rendered frames")
+        p = filedialog.askdirectory(title="Select output folder")
         if p:
             out_var.set(p)
 
-    make_btn(r2, "Browse…", browse_out, pady=4).pack(side="right")
+    make_btn(r2, "Browse", browse_out, pady=5).pack(side="right")
 
-    r3 = tk.Frame(rf, bg=CARD)
-    r3.pack(fill="x", pady=(0, 10))
-    tk.Label(r3, text="Frames:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    _entry(r3, f0_var, width=7).pack(side="left", ipady=4)
-    tk.Label(r3, text="to", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=6)
-    _entry(r3, f1_var, width=7).pack(side="left", ipady=4)
-    tk.Label(r3, text="Prefix:", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(18, 6))
-    _entry(r3, prefix_var, width=8).pack(side="left", ipady=4)
-    tk.Label(r3, text="Samples (0=default):", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(18, 6))
-    _entry(r3, samples_var, width=7).pack(side="left", ipady=4)
+    r3 = _row("Frames")
+    _entry(r3, f0_var, width=7).pack(side="left", ipady=5)
+    tk.Label(r3, text="to", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=8)
+    _entry(r3, f1_var, width=7).pack(side="left", ipady=5)
+    tk.Label(r3, text="Prefix", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
+    _entry(r3, prefix_var, width=8).pack(side="left", ipady=5)
+    tk.Label(r3, text="Samples", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
+    _entry(r3, samples_var, width=7).pack(side="left", ipady=5)
+    tk.Label(r3, text="(0 = default)", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
 
-    r4 = tk.Frame(rf, bg=CARD)
-    r4.pack(fill="x", pady=(0, 10))
-    tk.Label(r4, text="GPU / Workers:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    ttk.Combobox(r4, textvariable=gpu_var, values=("L4", "T4", "A100", "H100", "G4", "CPU"), width=7, state="readonly", style="Dark.TCombobox").pack(side="left")
-    tk.Label(r4, text="Parallel:", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(14, 6))
-    ttk.Combobox(r4, textvariable=par_var, values=("1", "2", "3", "4"), width=4, state="readonly", style="Dark.TCombobox").pack(side="left")
-    tk.Label(r4, text="Session (-s):", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(14, 6))
-    _entry(r4, session_var, width=16).pack(side="left", ipady=4)
+    r4 = _row("GPU")
+    ttk.Combobox(r4, textvariable=gpu_var, values=("L4", "T4", "A100", "H100", "G4", "CPU"), width=7, state="readonly", style="Clean.TCombobox").pack(side="left")
+    tk.Label(r4, text="Workers", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(20, 8))
+    ttk.Combobox(r4, textvariable=par_var, values=("1", "2", "3", "4"), width=4, state="readonly", style="Clean.TCombobox").pack(side="left")
+    tk.Label(r4, text="Session", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(20, 8))
+    _entry(r4, session_var, width=16).pack(side="left", ipady=5)
     tk.Checkbutton(
         r4,
-        text="Keep VM (--keep)",
+        text="Keep VM open",
         variable=keep_var,
-        bg=CARD,
+        bg=SURFACE,
         fg=TEXT,
-        selectcolor=CARD_ALT,
-        activebackground=CARD,
+        selectcolor=CONTROL,
+        activebackground=SURFACE,
         activeforeground=TEXT,
         font=("Segoe UI", 9),
-    ).pack(side="left", padx=(14, 0))
+    ).pack(side="left", padx=(18, 0))
 
-    r5 = tk.Frame(rf, bg=CARD)
-    r5.pack(fill="x", pady=(0, 6))
-    tk.Label(r5, text="Extras:", bg=CARD, fg=MUTED, width=14, anchor="w", font=("Segoe UI", 9)).pack(side="left")
-    _entry(r5, extras_var).pack(side="left", fill="x", expand=True, ipady=4)
+    r5 = _row("Extra options")
+    _entry(r5, extras_var).pack(side="left", fill="x", expand=True, ipady=5)
     tk.Label(
         rf,
-        text="Optional space-separated cloud_render.py extras, e.g. `fmt=exr pct=50` or `fmt=v7 camera=CAM_1`.",
-        bg=CARD,
+        text="Optional: fmt=exr, fmt=v7, pct=50, engine=cycles, camera=Name. Choosing a .json file runs it as a queue.",
+        bg=SURFACE,
         fg=MUTED,
         font=("Segoe UI", 8),
-    ).pack(anchor="w", padx=(106, 0))
+    ).pack(anchor="w", padx=(92, 0), pady=(2, 0))
 
     # =========================================================================
-    # Shared helpers & live polling
+    # TAB 3: ACCOUNTS
+    # =========================================================================
+    acc_actions = tk.Frame(tab_accounts, bg=BG)
+    acc_actions.pack(fill="x", side="bottom", pady=(10, 2))
+
+    acc_card = tk.Frame(tab_accounts, bg=SURFACE)
+    acc_card.pack(fill="both", expand=True, pady=(10, 0))
+
+    cols = ("email", "status", "balance", "rate", "vms")
+    tree = ttk.Treeview(acc_card, columns=cols, show="headings", style="Clean.Treeview", selectmode="browse", height=7)
+    tree.heading("email", text="Account")
+    tree.heading("status", text="Status")
+    tree.heading("balance", text="Balance")
+    tree.heading("rate", text="Rate")
+    tree.heading("vms", text="VMs")
+    tree.column("email", width=330, anchor="w", stretch=True)
+    tree.column("status", width=90, anchor="center", stretch=False)
+    tree.column("balance", width=120, anchor="e", stretch=False)
+    tree.column("rate", width=95, anchor="e", stretch=False)
+    tree.column("vms", width=70, anchor="center", stretch=False)
+    tree.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+    tk.Label(acc_card, text="Double-click an account to switch.", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(
+        anchor="w", padx=14, pady=(0, 8)
+    )
+
+    # =========================================================================
+    # Helpers & live polling
     # =========================================================================
     def set_status(msg: str, color: str = MUTED) -> None:
         status_var.set(msg)
@@ -1077,32 +1021,23 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         accounts = idx.get("accounts", {})
 
         if active_email:
-            lbl_active_email.configure(text=active_email, fg=TEXT)
             info = live_cache.get(active_email) or accounts.get(active_email, {})
             bal = info.get("balance")
-            rate = info.get("rate")
-            vms = info.get("assignments_count")
-            chk = info.get("checked_at", "")
-            assigns = info.get("assignments") or []
+            vms = info.get("assignments_count") or 0
+            lbl_top_account.configure(text=active_email, fg=TEXT)
             if bal is not None:
                 cu_color = GREEN if bal >= 10 else (AMBER if bal > 0 else RED)
-                lbl_cu_val.configure(text=f"{bal:.2f} CU", fg=cu_color)
-                lbl_active_meta.configure(text=f"Usage rate: {rate:.2f} CU/hr   •   OS keyring synced with `colab` CLI")
-                vm_text = f"{vms} active VM{'s' if vms != 1 else ''}"
-                lbl_vm_val.configure(text=vm_text, fg=AMBER if vms else MUTED)
+                lbl_top_cu.configure(text=f"{bal:.2f} CU", fg=cu_color)
+                lbl_top_vm.configure(text=f"{vms} VM{'s' if vms != 1 else ''}" if vms else "Idle", fg=AMBER if vms else MUTED)
                 btn_stop_vms.configure(state="normal" if vms else "disabled")
             else:
-                lbl_cu_val.configure(text="… CU", fg=MUTED)
-                lbl_active_meta.configure(text="Loading live Compute Units balance…")
-                lbl_vm_val.configure(text="")
+                lbl_top_cu.configure(text="...", fg=MUTED)
+                lbl_top_vm.configure(text="", fg=MUTED)
                 btn_stop_vms.configure(state="normal")
-            lbl_checked.configure(text=f"Updated {chk}" if chk else "")
         else:
-            lbl_active_email.configure(text="Not signed in", fg=AMBER)
-            lbl_active_meta.configure(text="Click '+ Add Account' below to connect a Google account.")
-            lbl_cu_val.configure(text="— CU", fg=MUTED)
-            lbl_vm_val.configure(text="0 active VMs", fg=MUTED)
-            lbl_checked.configure(text="")
+            lbl_top_account.configure(text="Not signed in", fg=AMBER)
+            lbl_top_cu.configure(text="", fg=MUTED)
+            lbl_top_vm.configure(text="Click to add", fg=MUTED)
             btn_stop_vms.configure(state="disabled")
 
         selected = tree.selection()
@@ -1112,25 +1047,23 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 
         for email in sorted(accounts.keys()):
             meta = live_cache.get(email) or accounts.get(email, {})
-            is_active = email == active_email
-            st_txt = "● ACTIVE" if is_active else ""
-            err = meta.get("error")
-            if err:
-                bal_txt, rate_txt, vm_txt = "Auth error", "—", "—"
+            st_txt = "Active" if email == active_email else ""
+            if meta.get("error"):
+                bal_txt, rate_txt, vm_txt = "Sign-in expired", "-", "-"
             elif meta.get("balance") is not None:
                 bal_txt = f"{meta['balance']:.2f} CU"
                 rate_txt = f"{meta.get('rate', 0.0):.2f}/hr"
                 vm_txt = str(meta.get("assignments_count", 0))
             else:
-                bal_txt, rate_txt, vm_txt = "—", "—", "—"
-            tree.insert("", "end", iid=email, values=(st_txt, email, bal_txt, rate_txt, vm_txt))
+                bal_txt, rate_txt, vm_txt = "-", "-", "-"
+            tree.insert("", "end", iid=email, values=(email, st_txt, bal_txt, rate_txt, vm_txt))
 
         if prev_sel and prev_sel in accounts:
             tree.selection_set(prev_sel)
         elif active_email and active_email in accounts:
             tree.selection_set(active_email)
 
-        # Populate Live Monitor VM table across ALL saved accounts
+        # Populate Running VMs table across all saved accounts
         vm_sel = vm_tree.selection()
         prev_vm_sel = vm_sel[0] if vm_sel else None
         for item in vm_tree.get_children():
@@ -1146,22 +1079,16 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             rate_val = meta.get("rate", 0.0)
             for a in assigns:
                 ep = str(a.get("endpoint", ""))
-                sname = ep_map.get(ep, "(browser / external)")
-                acc_lbl = f"● {email}" if email == active_email else email
+                sname = ep_map.get(ep, "Browser / external")
                 row_id = f"{email}::{ep}"
                 vm_row_map[row_id] = (email, ep)
-                vm_tree.insert(
-                    "",
-                    "end",
-                    iid=row_id,
-                    values=(acc_lbl, sname, a.get("accelerator", "?"), a.get("shape", "STD"), ep[:22], f"{rate_val:.2f}/hr"),
-                )
+                vm_tree.insert("", "end", iid=row_id, values=(email, sname, a.get("accelerator", "?"), f"{rate_val:.2f}/hr"))
                 total_running += 1
         if prev_vm_sel and prev_vm_sel in vm_row_map:
             vm_tree.selection_set(prev_vm_sel)
         lbl_total_vms.configure(
-            text=f"{total_running} running across all accounts" if total_running else "0 running (0.00 CU/hr)",
-            fg=AMBER if total_running else GREEN,
+            text=f"{total_running} active" if total_running else "None",
+            fg=AMBER if total_running else MUTED,
         )
         btn_stop_one_vm.configure(state="normal" if total_running else "disabled")
 
@@ -1191,28 +1118,27 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                     except Exception:
                         pass
 
-            # Build dropdown labels (active jobs first, then recent finished)
             job_entries.sort(key=lambda x: (0 if x[1].get("status") in active_states else 1, -float(x[1].get("updated_at") or 0)))
             labels = []
             by_label: dict[str, str] = {}
             by_id: dict[str, tuple[dict[str, Any], Path, str]] = {}
+            seen_labels: dict[str, int] = {}
             for rid, d, lp in job_entries:
-                st = str(d.get("status", "idle")).upper()
+                st = str(d.get("status", "idle")).capitalize()
                 jname = d.get("job_name") or Path(d.get("blend") or rid).name
                 done_f = int(d.get("done_frames") or 0)
                 tot_f = int(d.get("total_frames") or 0)
                 gpu = d.get("gpu") or "?"
-                sess = d.get("session") or ""
-                lbl = f"[{st}] {jname} ({done_f}/{tot_f}) — {gpu} / {sess} [{rid[-5:]}]"
+                base_lbl = f"{jname}  ({done_f}/{tot_f} · {gpu} · {st})"
+                cnt = seen_labels.get(base_lbl, 0) + 1
+                seen_labels[base_lbl] = cnt
+                lbl = base_lbl if cnt == 1 else f"{base_lbl} #{cnt}"
                 labels.append(lbl)
                 by_label[lbl] = rid
                 by_id[rid] = (d, lp, lbl)
 
             log_state["jobs_by_label"] = by_label
             log_state["jobs_by_id"] = by_id
-            active_cnt = sum(1 for _, d, _ in job_entries if d.get("status") in active_states)
-            hist_cnt = len(job_entries) - active_cnt
-            lbl_jobs_hdr.configure(text=f"JOBS ({active_cnt} live, {hist_cnt} past):")
 
             if labels:
                 job_combo.configure(values=labels)
@@ -1225,17 +1151,17 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                     job_sel_var.set(cur_lbl)
 
                 st = str(data.get("status", "idle"))
-                badge_colors = {
-                    "rendering": (GREEN, "#132a1c"),
-                    "uploading": (ACCENT, "#172554"),
-                    "provisioning": (AMBER, "#3b270c"),
-                    "preparing": (AMBER, "#3b270c"),
-                    "done": (GREEN, "#132a1c"),
-                    "error": (RED, "#3b1518"),
-                    "stopped": (MUTED, CARD_ALT),
+                badge_map = {
+                    "rendering": ("Rendering", GREEN, "#142a22"),
+                    "uploading": ("Uploading", "#60a5fa", "#17253d"),
+                    "provisioning": ("Starting VM", AMBER, "#2e2412"),
+                    "preparing": ("Preparing", AMBER, "#2e2412"),
+                    "done": ("Done", GREEN, "#142a22"),
+                    "error": ("Error", RED, DANGER_BG),
+                    "stopped": ("Stopped", MUTED, CONTROL),
                 }
-                fg_c, bg_c = badge_colors.get(st, (MUTED, CARD_ALT))
-                lbl_job_badge.configure(text=st.upper(), fg=fg_c, bg=bg_c)
+                b_txt, fg_c, bg_c = badge_map.get(st, (st.capitalize(), MUTED, CONTROL))
+                lbl_job_badge.configure(text=b_txt, fg=fg_c, bg=bg_c)
 
                 total = max(0, int(data.get("total_frames") or 0))
                 done = max(0, int(data.get("done_frames") or 0))
@@ -1245,41 +1171,40 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                 avg_s = float(data.get("avg_frame_sec") or 0.0)
                 par = max(1, int(data.get("par") or 1))
                 rem = max(0, total - done)
-                eta = _fmt_eta((rem * avg_s) / par) if (avg_s > 0 and rem > 0 and st == "rendering") else "—"
-                last_f = data.get("last_frame") or ""
-                last_s = float(data.get("last_frame_sec") or 0.0)
-                last_part = f" • last: {last_f} ({last_s:.1f}s)" if last_f else ""
-                lbl_job_progress.configure(text=f"{done} / {total} frames ({pct:.0f}%) • ETA {eta}{last_part}")
+                eta = _fmt_eta((rem * avg_s) / par) if (avg_s > 0 and rem > 0 and st == "rendering") else ""
+                err_txt = data.get("error") or ""
+                if err_txt:
+                    lbl_job_progress.configure(text=err_txt[:110], fg=RED)
+                else:
+                    parts = [f"{done} / {total} frames ({pct:.0f}%)"]
+                    if eta:
+                        parts.append(eta)
+                    if avg_s > 0:
+                        parts.append(f"{avg_s:.1f}s / frame")
+                    lbl_job_progress.configure(text="   ·   ".join(parts), fg=TEXT)
 
                 out_dir = data.get("out_dir") or ""
                 log_state["last_out_dir"] = out_dir
-                gpu = data.get("gpu") or "?"
-                sess = data.get("session") or ""
-                err_txt = data.get("error") or ""
-                if err_txt:
-                    lbl_job_detail.configure(text=f"Error: {err_txt}", fg=RED)
-                else:
-                    lbl_job_detail.configure(text=f"GPU: {gpu} • {par} worker(s) • session: {sess} • out: {out_dir}", fg=MUTED)
                 btn_open_out.configure(state="normal" if out_dir and os.path.exists(out_dir) else "disabled")
                 btn_cancel_render.configure(state="normal" if st in active_states else "disabled")
 
-                # Update live frame preview thumbnail
+                # Update frame thumbnail
                 fp = data.get("last_frame_path") or ""
                 if fp and fp != log_state["thumb_path"] and os.path.isfile(fp) and fp.lower().endswith(".png"):
                     try:
                         img = tk.PhotoImage(file=fp)
                         w_i, h_i = img.width(), img.height()
-                        scale = max(1, int(max(w_i / 242, h_i / 150)))
+                        scale = max(1, int(max(w_i / 276, h_i / 210)))
                         if scale > 1:
                             img = img.subsample(scale, scale)
                         log_state["thumb_img"] = img
                         log_state["thumb_path"] = fp
                         lbl_preview_img.configure(image=img, text="")
-                        lbl_preview_cap.configure(text=os.path.basename(fp))
+                        lbl_preview_cap.configure(text=f"{os.path.basename(fp)}  (click to open)")
                     except Exception:
                         pass
 
-                # Tail selected job's log incrementally
+                # Tail selected job's log
                 if sel_rid != log_state["tailed_run_id"]:
                     log_state["tailed_run_id"] = sel_rid
                     log_state["offset"] = 0
@@ -1305,7 +1230,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             return
         busy["refresh"] = True
         if not silent:
-            set_status("Checking saved accounts and live Compute Unit balances...", MUTED)
+            set_status("Refreshing...", MUTED)
 
         def worker() -> None:
             try:
@@ -1316,7 +1241,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                 for em in emails:
                     tok = _get_account_token_json(em)
                     if not tok:
-                        live_cache[em] = {"error": "Missing keyring token"}
+                        live_cache[em] = {"error": "Missing credential"}
                         continue
                     try:
                         info = _query_account_live_status(tok)
@@ -1336,11 +1261,11 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                     except Exception as e:
                         live_cache[em] = {"error": str(e)}
                 _save_index(idx)
-                msg = f"Updated {len(emails)} account(s) at {datetime.now().strftime('%H:%M:%S')}."
-                root.after(0, lambda: _done_refresh(msg, GREEN if not silent else MUTED))
+                msg = f"Updated {datetime.now().strftime('%H:%M:%S')}"
+                root.after(0, lambda: _done_refresh(msg, MUTED))
             except Exception as e:
                 err_msg = str(e)
-                root.after(0, lambda: _done_refresh(f"Refresh error: {err_msg}", RED))
+                root.after(0, lambda: _done_refresh(f"Refresh failed: {err_msg}", RED))
 
         def _done_refresh(msg: str, color: str) -> None:
             busy["refresh"] = False
@@ -1351,60 +1276,54 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     def schedule_auto_refresh() -> None:
-        if auto_refresh_var.get():
-            refresh_all(sync_first=False, silent=True)
+        refresh_all(sync_first=False, silent=True)
         root.after(15000, schedule_auto_refresh)
 
     def do_switch(_event=None) -> None:
         sel = tree.selection()
         if not sel:
-            messagebox.showinfo("Select Account", "Select an account from the list first.")
             return
         target_email = sel[0]
         idx = _load_index()
         old_active = idx.get("active")
         if old_active == target_email:
-            set_status(f"{target_email} is already the active account.", MUTED)
+            set_status(f"Already using {target_email}", MUTED)
             return
 
         old_vms = (live_cache.get(old_active) or idx.get("accounts", {}).get(old_active or "", {})).get("assignments_count", 0)
         if old_active and old_vms:
             ans = messagebox.askyesnocancel(
-                "Active GPU VM Running",
-                f"{old_active} currently has {old_vms} active Colab VM(s).\n\n"
-                "Stop those VM(s) before switching so you don't burn Compute Units?",
+                "Running VM",
+                f"{old_active} still has {old_vms} running VM(s).\nStop them before switching?",
             )
             if ans is None:
                 return
             if ans is True:
-                set_status(f"Stopping active VM(s) on {old_active}...", AMBER)
+                set_status(f"Stopping VMs on {old_active}...", AMBER)
                 root.update_idletasks()
                 try:
                     stop_all_vms_for_account(old_active)
                 except Exception as e:
-                    messagebox.showerror("Stop VM Failed", str(e))
+                    messagebox.showerror("Error", str(e))
                     return
 
         try:
             switch_active_account(target_email)
             render_accounts_ui()
-            set_status(f"Switched active account to {target_email}.", GREEN)
+            set_status(f"Switched to {target_email}", GREEN)
             refresh_all(sync_first=False)
         except Exception as e:
             messagebox.showerror("Switch Failed", str(e))
-            set_status(f"Switch failed: {e}", RED)
+            set_status(str(e), RED)
 
     def do_stop_vms() -> None:
         idx = _load_index()
         active_email = idx.get("active")
         if not active_email:
             return
-        if not messagebox.askyesno(
-            "Stop Active VMs",
-            f"Disconnect and delete all running Colab VMs on {active_email}?",
-        ):
+        if not messagebox.askyesno("Stop VMs", f"Stop all running Colab VMs on {active_email}?"):
             return
-        set_status(f"Stopping running VMs on {active_email}...", AMBER)
+        set_status(f"Stopping VMs on {active_email}...", AMBER)
 
         def worker() -> None:
             try:
@@ -1417,9 +1336,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         def _after_stop(n: int, err: Optional[str]) -> None:
             if err:
                 messagebox.showerror("Stop Failed", err)
-                set_status(f"Failed to stop VMs: {err}", RED)
+                set_status(err, RED)
             else:
-                set_status(f"Stopped {n} VM(s) on {active_email}.", GREEN)
+                set_status(f"Stopped {n} VM(s)", GREEN)
                 refresh_all(sync_first=False)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1427,18 +1346,14 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
     def do_remove() -> None:
         sel = tree.selection()
         if not sel:
-            messagebox.showinfo("Select Account", "Select an account to remove.")
             return
         email = sel[0]
-        if not messagebox.askyesno(
-            "Remove Account",
-            f"Remove saved credentials for {email} from this machine?\n(Your Google account and Colab data are untouched.)",
-        ):
+        if not messagebox.askyesno("Remove Account", f"Remove saved sign-in for {email}?"):
             return
         remove_saved_account(email)
         live_cache.pop(email, None)
         render_accounts_ui()
-        set_status(f"Removed {email}.", MUTED)
+        set_status(f"Removed {email}", MUTED)
 
     def do_clear_history() -> None:
         active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
@@ -1458,24 +1373,27 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                     pass
         log_state["selected_run_id"] = None
         log_state["tailed_run_id"] = None
+        log_state["thumb_path"] = ""
+        log_state["thumb_img"] = None
+        lbl_preview_img.configure(image="", text="Latest frame")
+        lbl_preview_cap.configure(text="")
         clear_log_box()
         job_combo.configure(values=[])
-        job_sel_var.set("No render jobs yet")
-        lbl_job_badge.configure(text="IDLE", fg=MUTED, bg=CARD_ALT)
-        lbl_job_progress.configure(text="0 / 0 frames")
+        job_sel_var.set("No recent renders")
+        lbl_job_badge.configure(text="Idle", fg=MUTED, bg=CONTROL)
+        lbl_job_progress.configure(text="Ready to render", fg=TEXT)
         pbar.configure(value=0)
-        set_status(f"Cleared {removed} finished/errored job record(s).", MUTED)
+        set_status(f"Cleared {removed} past job(s)", MUTED)
         poll_render_monitor(reschedule=False)
 
     def do_stop_one_vm() -> None:
         sel = vm_tree.selection()
         if not sel or sel[0] not in vm_row_map:
-            messagebox.showinfo("Select VM", "Select a running VM in the Active Colab VMs table first.")
             return
         email, ep = vm_row_map[sel[0]]
-        if not messagebox.askyesno("Stop Selected VM", f"Disconnect and delete VM `{ep[:22]}…` on {email}?"):
+        if not messagebox.askyesno("Stop VM", f"Stop this VM on {email}?"):
             return
-        set_status(f"Stopping VM {ep[:14]}… on {email}...", AMBER)
+        set_status(f"Stopping VM on {email}...", AMBER)
 
         def worker() -> None:
             try:
@@ -1488,9 +1406,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         def _done(err: Optional[str]) -> None:
             if err:
                 messagebox.showerror("Stop VM Failed", err)
-                set_status(f"Stop VM failed: {err}", RED)
+                set_status(err, RED)
             else:
-                set_status(f"Stopped VM on {email}.", GREEN)
+                set_status(f"Stopped VM on {email}", GREEN)
                 refresh_all(sync_first=False)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1501,7 +1419,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             return
         target = blend_var.get().strip()
         if not target or not Path(target).is_file():
-            messagebox.showerror("Select File", "Please choose an existing .blend or jobs.json file first.")
+            messagebox.showerror("Select File", "Choose a .blend or jobs.json file first.")
             return
 
         py_exe = sys.executable
@@ -1510,8 +1428,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             if cand.is_file():
                 py_exe = str(cand)
 
+        is_queue = target.lower().endswith(".json")
         cmd = [py_exe, str(RENDER_SCRIPT)]
-        if mode_var.get() == "queue":
+        if is_queue:
             cmd += ["queue", target]
         else:
             cmd += ["shot", target]
@@ -1525,7 +1444,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                 for tok in shlex.split(extras_var.get().strip()):
                     cmd += ["--extra", tok]
 
-        sess_name = session_var.get().strip() or "blender-render"
+        sess_name = session_var.get().strip() or "fetch-render"
         cmd += ["--gpu", gpu_var.get() or "L4", "--par", par_var.get() or "3", "-s", sess_name]
         if keep_var.get():
             cmd.append("--keep")
@@ -1537,11 +1456,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             log_state["selected_run_id"] = None
             log_state["tailed_run_id"] = "__dry__"
             clear_log_box()
-            append_log_lines(f"[gui] Dry run: {' '.join(cmd)}\n")
         else:
-            # Auto-select the newly spawned job once its telemetry file appears
             log_state["selected_run_id"] = None
-        set_status("Dry-running shot..." if dry_run else f"Render started on session '{sess_name}' (no CMD window).", ACCENT)
+        set_status("Checking scene..." if dry_run else f"Starting render on {gpu_var.get()}...", ACCENT)
 
         def worker() -> None:
             env = os.environ.copy()
@@ -1576,12 +1493,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 
             def _done() -> None:
                 if dry_run:
-                    set_status("Dry run finished." if rc == 0 else f"Dry run failed (rc={rc}).", GREEN if rc == 0 else RED)
+                    set_status("Scene check passed" if rc == 0 else f"Scene check failed (code {rc})", GREEN if rc == 0 else RED)
                 else:
-                    set_status(
-                        f"Render '{sess_name}' finished!" if rc == 0 else f"Render '{sess_name}' ended (rc={rc}).",
-                        GREEN if rc == 0 else AMBER,
-                    )
+                    set_status("Render finished" if rc == 0 else f"Render ended (code {rc})", GREEN if rc == 0 else AMBER)
                     refresh_all(sync_first=False)
 
             root.after(0, _done)
@@ -1597,10 +1511,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         data = entry[0]
         pid = int(data.get("pid") or 0)
         sess = data.get("session") or ""
-        if not messagebox.askyesno(
-            "Stop Selected Render",
-            f"Terminate render job '{data.get('job_name', '')}' (session: {sess}, pid: {pid})?",
-        ):
+        if not messagebox.askyesno("Stop Render", f"Stop '{data.get('job_name', '')}' and its Colab VM?"):
             return
         if pid and _is_pid_alive(pid):
             if os.name == "nt":
@@ -1610,7 +1521,6 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                     os.kill(pid, 15)
                 except OSError:
                     pass
-        # Also stop that specific session if it exists on the active account
         if sess:
             idx = _load_index()
             active_em = idx.get("active")
@@ -1622,20 +1532,20 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
                             stop_one_vm(active_em, ep)
                         except Exception:
                             pass
-        set_status(f"Stopped job '{data.get('job_name', '')}'.", AMBER)
+        set_status(f"Stopped {data.get('job_name', 'render')}", AMBER)
         refresh_all(sync_first=False)
 
     def open_add_account_dialog() -> None:
         try:
             flow, auth_url = begin_oauth_flow()
         except Exception as e:
-            messagebox.showerror("OAuth Error", str(e))
+            messagebox.showerror("Sign-In Error", str(e))
             return
 
         dlg = tk.Toplevel(root)
         dlg.title("Add Google Account")
-        dlg.geometry("600x360")
-        dlg.minsize(560, 340)
+        dlg.geometry("540x320")
+        dlg.minsize(500, 300)
         dlg.configure(bg=BG)
         dlg.transient(root)
         dlg.grab_set()
@@ -1643,44 +1553,43 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         btn_row = tk.Frame(dlg, bg=BG)
         btn_row.pack(fill="x", side="bottom", padx=20, pady=(6, 16))
 
-        tk.Label(dlg, text="Sign in with a Google Account", bg=BG, fg=TEXT, font=("Segoe UI", 13, "bold")).pack(
+        tk.Label(dlg, text="Sign in with Google", bg=BG, fg=TEXT, font=("Segoe UI", 12, "bold")).pack(
             anchor="w", padx=20, pady=(16, 4)
         )
         tk.Label(
             dlg,
-            text="1. Open the sign-in link in your browser (or copy it into an Incognito / other Chrome profile).\n"
-                 "2. Choose the Google account you want to add and approve access.\n"
-                 "3. Copy the authorization code Google displays and paste it below.",
+            text="Open the sign-in page (or copy the link for another browser profile), approve access, then paste the code below.",
             bg=BG,
             fg=MUTED,
+            wraplength=490,
             justify="left",
             font=("Segoe UI", 9),
-        ).pack(anchor="w", padx=20, pady=(0, 12))
+        ).pack(anchor="w", padx=20, pady=(0, 14))
 
         url_btns = tk.Frame(dlg, bg=BG)
-        url_btns.pack(fill="x", padx=20, pady=(0, 12))
+        url_btns.pack(fill="x", padx=20, pady=(0, 14))
 
         def copy_url() -> None:
             dlg.clipboard_clear()
             dlg.clipboard_append(auth_url)
-            lbl_dlg_status.configure(text="Sign-in URL copied to clipboard! Paste into any browser profile.", fg=GREEN)
+            lbl_dlg_status.configure(text="Link copied to clipboard.", fg=GREEN)
 
         make_btn(
             url_btns,
-            "Open Sign-in Page in Browser",
-            lambda: (webbrowser.open(auth_url), lbl_dlg_status.configure(text="Opened sign-in page in default browser.", fg=MUTED)),
+            "Open Google Sign-In",
+            lambda: (webbrowser.open(auth_url), lbl_dlg_status.configure(text="Opened in browser.", fg=MUTED)),
             bg=ACCENT,
             hover=ACCENT_HOVER,
             bold=True,
         ).pack(side="left")
-        make_btn(url_btns, "Copy URL (for Incognito / other profile)", copy_url).pack(side="left", padx=(8, 0))
+        make_btn(url_btns, "Copy Link", copy_url).pack(side="left", padx=(8, 0))
 
-        tk.Label(dlg, text="Authorization code:", bg=BG, fg=TEXT, font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=20)
+        tk.Label(dlg, text="Authorization code", bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w", padx=20)
         code_var = tk.StringVar()
         entry = tk.Entry(
             dlg,
             textvariable=code_var,
-            bg=CARD,
+            bg=SURFACE,
             fg=TEXT,
             insertbackground=TEXT,
             relief="flat",
@@ -1694,26 +1603,26 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         activate_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
             dlg,
-            text="Switch to this account immediately",
+            text="Set as active account",
             variable=activate_var,
             bg=BG,
             fg=TEXT,
-            selectcolor=CARD,
+            selectcolor=SURFACE,
             activebackground=BG,
             activeforeground=TEXT,
             font=("Segoe UI", 9),
-        ).pack(anchor="w", padx=18, pady=(0, 8))
+        ).pack(anchor="w", padx=18)
 
-        lbl_dlg_status = tk.Label(dlg, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), wraplength=540, justify="left")
-        lbl_dlg_status.pack(anchor="w", padx=20, pady=(0, 6))
+        lbl_dlg_status = tk.Label(dlg, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8), wraplength=490, justify="left")
+        lbl_dlg_status.pack(anchor="w", padx=20, pady=(4, 0))
 
         def submit_code() -> None:
             code = code_var.get().strip()
             if not code:
-                lbl_dlg_status.configure(text="Paste the authorization code from Google first.", fg=AMBER)
+                lbl_dlg_status.configure(text="Paste the code from Google first.", fg=AMBER)
                 return
-            btn_connect.configure(state="disabled", text="Connecting…")
-            lbl_dlg_status.configure(text="Exchanging code & checking Compute Unit balance…", fg=MUTED)
+            btn_connect.configure(state="disabled", text="Signing in...")
+            lbl_dlg_status.configure(text="Connecting account...", fg=MUTED)
 
             def worker() -> None:
                 try:
@@ -1727,59 +1636,46 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
             def _on_ok(info: dict[str, Any]) -> None:
                 dlg.destroy()
                 render_accounts_ui()
-                set_status(f"Connected {info['email']} ({info['balance']:.2f} CU). Ready!", GREEN)
+                set_status(f"Signed in as {info['email']} ({info['balance']:.2f} CU)", GREEN)
 
             def _on_err(err: str) -> None:
-                btn_connect.configure(state="normal", text="Connect Account")
-                lbl_dlg_status.configure(text=f"Error: {err}", fg=RED)
+                btn_connect.configure(state="normal", text="Sign In")
+                lbl_dlg_status.configure(text=err, fg=RED)
 
             threading.Thread(target=worker, daemon=True).start()
 
-        btn_connect = make_btn(btn_row, "Connect Account", submit_code, bg=ACCENT, hover=ACCENT_HOVER, bold=True)
+        btn_connect = make_btn(btn_row, "Sign In", submit_code, bg=ACCENT, hover=ACCENT_HOVER, bold=True)
         btn_connect.pack(side="right")
         make_btn(btn_row, "Cancel", dlg.destroy).pack(side="right", padx=(0, 8))
         entry.bind("<Return>", lambda _e: submit_code())
 
-    # --- Wire Header, Tab 1, Tab 2, Tab 3 buttons ---
-    tk.Checkbutton(
-        h_right,
-        text="Auto-refresh (15s)",
-        variable=auto_refresh_var,
-        bg=BG,
-        fg=MUTED,
-        selectcolor=CARD,
-        activebackground=BG,
-        activeforeground=TEXT,
-        font=("Segoe UI", 9),
-    ).pack(side="left", padx=(0, 10))
-    make_btn(h_right, "Refresh All", lambda: refresh_all(sync_first=True)).pack(side="left", padx=(0, 8))
-    make_btn(h_right, "Buy CUs", lambda: webbrowser.open("https://colab.research.google.com/signup")).pack(side="left")
+    # --- Wire buttons ---
+    make_btn(tb_right, "Refresh", lambda: refresh_all(sync_first=True)).pack(side="left", padx=(0, 8))
+    make_btn(tb_right, "Buy units", lambda: webbrowser.open("https://colab.research.google.com/signup"), bg=SURFACE, hover=CONTROL, fg=MUTED).pack(side="left")
 
-    make_btn(acc_actions, "+ Add Account", open_add_account_dialog, bg=ACCENT, hover=ACCENT_HOVER, bold=True).pack(side="left")
-    make_btn(acc_actions, "Switch to Selected", do_switch).pack(side="left", padx=(8, 0))
-    btn_stop_vms = make_btn(acc_actions, "Stop Active VMs", do_stop_vms, bg="#3b1d20", fg="#fca5a5", hover="#58262b")
-    btn_stop_vms.pack(side="left", padx=(8, 0))
-    make_btn(acc_actions, "Remove Selected", do_remove).pack(side="right")
-
-    btn_stop_one_vm = make_btn(vm_hdr_btns, "Stop Selected VM", do_stop_one_vm, bg="#3b1d20", fg="#fca5a5", hover="#58262b", pady=3)
+    btn_stop_one_vm = make_btn(vm_hdr_btns, "Stop VM", do_stop_one_vm, bg=DANGER_BG, fg=RED, hover=DANGER_HOVER, padx=10, pady=3, font_size=8)
     btn_stop_one_vm.pack(side="left")
     btn_stop_one_vm.configure(state="disabled")
 
-    btn_open_out = make_btn(mon_btns, "Open Output Folder", lambda: _open_path_in_explorer(log_state["last_out_dir"]), pady=4)
+    btn_open_out = make_btn(mon_btns, "Open Folder", lambda: _open_path_in_explorer(log_state["last_out_dir"]), pady=4)
     btn_open_out.pack(side="left", padx=(0, 8))
     btn_open_out.configure(state="disabled")
-    btn_cancel_render = make_btn(mon_btns, "Stop Selected Job", do_cancel_render, bg="#3b1d20", fg="#fca5a5", hover="#58262b", pady=4)
+    btn_cancel_render = make_btn(mon_btns, "Stop", do_cancel_render, bg=DANGER_BG, fg=RED, hover=DANGER_HOVER, pady=4)
     btn_cancel_render.pack(side="left")
     btn_cancel_render.configure(state="disabled")
 
-    btn_dry_run = make_btn(ren_actions, "Dry Run (Check Assets)", lambda: do_launch_render(dry_run=True))
-    btn_dry_run.pack(side="left")
-    btn_start_render = make_btn(ren_actions, "▶ Start Render", lambda: do_launch_render(dry_run=False), bg=ACCENT, hover=ACCENT_HOVER, bold=True)
-    btn_start_render.pack(side="left", padx=(8, 0))
+    make_btn(ren_actions, "Check Scene", lambda: do_launch_render(dry_run=True)).pack(side="left")
+    make_btn(ren_actions, "Start Render", lambda: do_launch_render(dry_run=False), bg=ACCENT, hover=ACCENT_HOVER, bold=True).pack(side="left", padx=(8, 0))
+
+    make_btn(acc_actions, "Add Account", open_add_account_dialog, bg=ACCENT, hover=ACCENT_HOVER, bold=True).pack(side="left")
+    make_btn(acc_actions, "Use Selected", do_switch).pack(side="left", padx=(8, 0))
+    btn_stop_vms = make_btn(acc_actions, "Stop VMs", do_stop_vms, bg=DANGER_BG, fg=RED, hover=DANGER_HOVER)
+    btn_stop_vms.pack(side="left", padx=(8, 0))
+    make_btn(acc_actions, "Remove", do_remove, bg=SURFACE, hover=CONTROL, fg=MUTED).pack(side="right")
 
     tree.bind("<Double-1>", do_switch)
 
-    tab_map = {"accounts": tab_accounts, "monitor": tab_monitor, "render": tab_render}
+    tab_map = {"monitor": tab_monitor, "render": tab_render, "accounts": tab_accounts}
     if initial_tab in tab_map:
         nb.select(tab_map[initial_tab])
 
@@ -1797,8 +1693,8 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
     render_accounts_ui()
-    root.after(150, lambda: refresh_all(sync_first=True))
-    root.after(300, poll_render_monitor)
+    root.after(120, lambda: refresh_all(sync_first=True))
+    root.after(250, poll_render_monitor)
     root.after(15000, schedule_auto_refresh)
     try:
         root.mainloop()
@@ -1813,7 +1709,7 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 def main(argv: list[str]) -> int:
     as_json = "--json" in argv
     argv = [a for a in argv if a != "--json"]
-    initial_tab = "accounts"
+    initial_tab = "monitor"
     if "--tab" in argv:
         ti = argv.index("--tab")
         if ti + 1 < len(argv):
@@ -1828,8 +1724,9 @@ def main(argv: list[str]) -> int:
         if as_json:
             print(json.dumps({"launched": launched, "running": True}))
         else:
-            print("Opened Colab CLI Studio on Live Monitor." if launched else "Colab CLI Studio is already open.")
+            print("Opened Colab Render." if launched else "Colab Render is already open.")
         return 0
+
     if cmd == "list":
         sync_current_cli_login()
         idx = _load_index()
@@ -1859,26 +1756,20 @@ def main(argv: list[str]) -> int:
             print(json.dumps({"active": active, "accounts": rows}, indent=2))
             return 0
         if not rows:
-            print("No saved Colab accounts. Run `python colab_accounts.py` to add one.")
+            print("No saved accounts. Run `python colab_accounts.py` to sign in.")
             return 0
         for r in rows:
             mark = "*" if r["active"] else " "
             if "error" in r:
                 print(f"{mark} {r['email']:38s}  [error: {r['error']}]")
             else:
-                print(
-                    f"{mark} {r['email']:38s}  {r['balance']:7.2f} CU  "
-                    f"({r['rate']:.2f}/hr, {r['assignments_count']} VM)"
-                )
+                print(f"{mark} {r['email']:38s}  {r['balance']:7.2f} CU  ({r['rate']:.2f}/hr, {r['assignments_count']} VM)")
         return 0
 
     if cmd == "active":
         em = sync_current_cli_login()
         if not em:
-            if as_json:
-                print(json.dumps({"active": None}))
-            else:
-                print("Not signed in.")
+            print(json.dumps({"active": None}) if as_json else "Not signed in.")
             return 1
         tok = _get_active_token_json()
         assert tok is not None
@@ -1897,20 +1788,15 @@ def main(argv: list[str]) -> int:
                 )
             )
             return 0
-        print(f"Active account : {info['email']}")
-        print(f"Compute units  : {info['balance']:.2f} CU")
-        print(f"Usage rate     : {info['rate']:.2f}/hr")
-        print(f"Active VMs     : {info['assignments_count']}")
+        print(f"Account : {info['email']}")
+        print(f"Balance : {info['balance']:.2f} CU ({info['rate']:.2f}/hr, {info['assignments_count']} VM)")
         return 0
 
     if cmd == "switch":
         if len(argv) < 2:
             raise SystemExit("Usage: python colab_accounts.py switch <email>")
         em = switch_active_account(argv[1])
-        if as_json:
-            print(json.dumps({"switched_to": em}))
-        else:
-            print(f"Switched active Colab CLI account to: {em}")
+        print(json.dumps({"switched_to": em}) if as_json else f"Switched to {em}")
         return 0
 
     if cmd == "stop-vms":
@@ -1918,10 +1804,7 @@ def main(argv: list[str]) -> int:
         if not em:
             raise SystemExit("No active account.")
         n = stop_all_vms_for_account(em)
-        if as_json:
-            print(json.dumps({"email": em, "stopped_vms": n}))
-        else:
-            print(f"Stopped {n} active VM(s) on {em}.")
+        print(json.dumps({"email": em, "stopped_vms": n}) if as_json else f"Stopped {n} VM(s) on {em}")
         return 0
 
     if cmd == "vms":
@@ -1941,7 +1824,7 @@ def main(argv: list[str]) -> int:
                         {
                             "account": em,
                             "active_account": em == active,
-                            "session": ep_map.get(a["endpoint"], "(browser / external)"),
+                            "session": ep_map.get(a["endpoint"], "Browser / external"),
                             "accelerator": a["accelerator"],
                             "shape": a["shape"],
                             "endpoint": a["endpoint"],
@@ -1954,14 +1837,14 @@ def main(argv: list[str]) -> int:
             print(json.dumps({"vms": all_vms}, indent=2))
             return 0
         if not all_vms:
-            print("No active Colab VMs across any saved accounts.")
+            print("No active VMs.")
             return 0
         for v in all_vms:
             mark = "*" if v["active_account"] else " "
-            print(f"{mark} {v['account']:32s}  {v['session']:18s}  {v['accelerator']:5s}  {v['endpoint'][:22]}  ({v['rate']:.2f}/hr)")
+            print(f"{mark} {v['account']:32s}  {v['session']:18s}  {v['accelerator']:5s}  ({v['rate']:.2f}/hr)")
         return 0
 
-    raise SystemExit(f"Unknown command: {cmd}. Expected: gui | list | active | vms | switch <email> | stop-vms [email]")
+    raise SystemExit(f"Unknown command: {cmd}. Expected: gui | monitor | list | active | vms | switch <email> | stop-vms [email]")
 
 
 if __name__ == "__main__":
