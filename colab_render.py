@@ -373,7 +373,12 @@ def _stage_and_zip_shot(
 
 def _session_exists(session: str) -> bool:
     res = _run_colab(["status", "-s", session], check=False, capture=True)
-    return res.returncode == 0
+    txt = f"{res.stdout or ''}\n{res.stderr or ''}".lower()
+    if res.returncode != 0:
+        return False
+    if "not found" in txt or "no active" in txt or "expired" in txt:
+        return False
+    return True
 
 
 def _ensure_session(session: str, gpu: str, high_mem: bool) -> bool:
