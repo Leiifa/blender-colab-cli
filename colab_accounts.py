@@ -763,10 +763,13 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 
     mon_sel_row = tk.Frame(mon_top, bg=CARD)
     mon_sel_row.pack(fill="x", padx=14, pady=(8, 4))
-    tk.Label(mon_sel_row, text="RENDER JOB:", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold")).pack(side="left")
+    lbl_jobs_hdr = tk.Label(mon_sel_row, text="RENDER JOB:", bg=CARD, fg=MUTED, font=("Segoe UI", 8, "bold"))
+    lbl_jobs_hdr.pack(side="left")
     job_sel_var = tk.StringVar(value="No render jobs yet")
-    job_combo = ttk.Combobox(mon_sel_row, textvariable=job_sel_var, state="readonly", style="Dark.TCombobox", width=54)
+    job_combo = ttk.Combobox(mon_sel_row, textvariable=job_sel_var, state="readonly", style="Dark.TCombobox", width=46)
     job_combo.pack(side="left", padx=(8, 8), fill="x", expand=True)
+    btn_clear_hist = make_btn(mon_sel_row, "Clear History", lambda: do_clear_history(), pady=2, padx=8, font_size=8)
+    btn_clear_hist.pack(side="right", padx=(6, 0))
     lbl_job_badge = tk.Label(mon_sel_row, text="IDLE", bg=CARD_ALT, fg=MUTED, padx=8, pady=2, font=("Segoe UI", 8, "bold"))
     lbl_job_badge.pack(side="right")
 
@@ -1128,6 +1131,9 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
 
             log_state["jobs_by_label"] = by_label
             log_state["jobs_by_id"] = by_id
+            active_cnt = sum(1 for _, d, _ in job_entries if d.get("status") in active_states)
+            hist_cnt = len(job_entries) - active_cnt
+            lbl_jobs_hdr.configure(text=f"JOBS ({active_cnt} live, {hist_cnt} past):")
 
             if labels:
                 job_combo.configure(values=labels)
@@ -1354,6 +1360,33 @@ def launch_gui(*, initial_tab: str = "accounts") -> int:
         live_cache.pop(email, None)
         render_accounts_ui()
         set_status(f"Removed {email}.", MUTED)
+
+    def do_clear_history() -> None:
+        active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
+        removed = 0
+        if JOBS_DIR.is_dir():
+            for jp in list(JOBS_DIR.glob("*.json")):
+                try:
+                    d = json.loads(jp.read_text(encoding="utf-8"))
+                    st = str(d.get("status", "idle"))
+                    pid = int(d.get("pid") or 0)
+                    if st in active_states and pid and _is_pid_alive(pid):
+                        continue
+                    jp.unlink(missing_ok=True)
+                    jp.with_suffix(".log").unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+        log_state["selected_run_id"] = None
+        log_state["tailed_run_id"] = None
+        clear_log_box()
+        job_combo.configure(values=[])
+        job_sel_var.set("No render jobs yet")
+        lbl_job_badge.configure(text="IDLE", fg=MUTED, bg=CARD_ALT)
+        lbl_job_progress.configure(text="0 / 0 frames")
+        pbar.configure(value=0)
+        set_status(f"Cleared {removed} finished/errored job record(s).", MUTED)
+        poll_render_monitor(reschedule=False)
 
     def do_stop_one_vm() -> None:
         sel = vm_tree.selection()

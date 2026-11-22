@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -390,12 +391,86 @@ def _ensure_session(session: str, gpu: str, high_mem: bool) -> bool:
     return True
 
 
-def _exec_script(session: str, code: str, *, timeout: float = 0.0) -> None:
+def _kill_proc_tree(pid: int) -> None:
+    if not pid or pid <= 0:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATION_FLAGS,
+            check=False,
+        )
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def _exec_script(
+    session: str,
+    code: str,
+    *,
+    timeout: float = 180.0,
+    telemetry: Optional[_RenderTelemetry] = None,
+    retries: int = 3,
+    label: str = "exec",
+) -> None:
+    """Run a short Python snippet on Colab with a local wall-clock watchdog & retry.
+
+    Works around an upstream google-colab-cli / jupyter_kernel_client bug where a slow
+    websocket handshake leaves a non-daemon ping thread alive so `colab exec` never exits.
+    """
+    log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
         tf.write(code)
         tmp_path = tf.name
     try:
-        _run_colab(["exec", "-s", session, "--timeout", str(timeout), "-f", tmp_path], check=True)
+        last_err = ""
+        for attempt in range(1, retries + 1):
+            proc = subprocess.Popen(
+                [_find_colab(), "exec", "-s", session, "--timeout", str(int(timeout)), "-f", tmp_path],
+                env=_colab_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=CREATION_FLAGS,
+            )
+            lines: list[str] = []
+            timed_out = {"flag": False}
+
+            def _watchdog() -> None:
+                timed_out["flag"] = True
+                log(f"[warn] {label} hung past {int(timeout) + 20}s (colab websocket deadlock) — killing PID {proc.pid}...")
+                _kill_proc_tree(proc.pid)
+
+            timer = threading.Timer(timeout + 20.0, _watchdog)
+            timer.daemon = True
+            timer.start()
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    s = line.rstrip()
+                    lines.append(s)
+                    if s:
+                        log(s)
+                rc = proc.wait()
+            finally:
+                timer.cancel()
+
+            if rc == 0 and not timed_out["flag"]:
+                return
+            tail = " | ".join(lines[-3:]) if lines else f"rc={rc}"
+            last_err = f"{label} timed out" if timed_out["flag"] else f"{label} failed (rc={rc}): {tail}"
+            if attempt < retries:
+                log(f"[warn] {last_err} — retrying ({attempt}/{retries})...")
+                time.sleep(3 * attempt)
+        raise RuntimeError(last_err)
     finally:
         try:
             os.remove(tmp_path)
@@ -403,9 +478,10 @@ def _exec_script(session: str, code: str, *, timeout: float = 0.0) -> None:
             pass
 
 
-def _ensure_remote_blender(session: str, version: str) -> None:
+def _ensure_remote_blender(session: str, version: str, telemetry: Optional[_RenderTelemetry] = None) -> None:
+    log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
     tar_url = _blender_tar_url(version)
-    print(f"[colab] Checking GPU & Blender {version} on '{session}'...")
+    log(f"[colab] Checking GPU & Blender {version} on '{session}'...")
     setup_code = textwrap.dedent(f"""
         import os, subprocess
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -431,14 +507,16 @@ def _ensure_remote_blender(session: str, version: str) -> None:
         os.makedirs("/content/bundle", exist_ok=True)
         os.makedirs("/content/out", exist_ok=True)
     """).strip()
-    _exec_script(session, setup_code, timeout=600)
+    _exec_script(session, setup_code, timeout=480, telemetry=telemetry, retries=3, label="blender-setup")
 
 
-def _upload_bundle(session: str, zip_path: Path) -> None:
+def _upload_bundle(session: str, zip_path: Path, telemetry: Optional[_RenderTelemetry] = None) -> None:
+    log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
     total = zip_path.stat().st_size
     if total <= CHUNK_BYTES:
-        print(f"[colab] Uploading {zip_path.name} ({total / 1e6:.2f} MB)...")
+        log(f"[colab] Uploading {zip_path.name} ({total / 1e6:.2f} MB)...")
         _run_colab(["upload", "-s", session, str(zip_path), "/content/bundle.zip"], check=True)
+        log("[colab] Unpacking bundle on VM...")
         unpack_code = textwrap.dedent("""
             import os, shutil, zipfile
             shutil.rmtree("/content/bundle", ignore_errors=True)
@@ -448,11 +526,11 @@ def _upload_bundle(session: str, zip_path: Path) -> None:
             os.remove("/content/bundle.zip")
             print("UNPACKED:", sorted(os.listdir("/content/bundle/blender")), flush=True)
         """).strip()
-        _exec_script(session, unpack_code, timeout=300)
+        _exec_script(session, unpack_code, timeout=120, telemetry=telemetry, retries=3, label="bundle-unpack")
         return
 
     n_chunks = (total + CHUNK_BYTES - 1) // CHUNK_BYTES
-    print(f"[colab] Uploading {zip_path.name} ({total / 1e6:.2f} MB in {n_chunks} chunks)...")
+    log(f"[colab] Uploading {zip_path.name} ({total / 1e6:.2f} MB in {n_chunks} chunks)...")
     with tempfile.TemporaryDirectory(prefix="colab_chunks_") as tmpdir:
         with open(zip_path, "rb") as src:
             for idx in range(n_chunks):
@@ -460,8 +538,9 @@ def _upload_bundle(session: str, zip_path: Path) -> None:
                 chunk_file.write_bytes(src.read(CHUNK_BYTES))
                 remote = f"/content/bundle_part_{idx:03d}.bin"
                 _run_colab(["upload", "-s", session, str(chunk_file), remote], check=True)
-                print(f"  uploaded chunk {idx + 1}/{n_chunks}")
+                log(f"  uploaded chunk {idx + 1}/{n_chunks}")
 
+    log("[colab] Reassembling and unpacking bundle on VM...")
     unpack_code = textwrap.dedent(f"""
         import os, shutil, zipfile
         with open("/content/bundle.zip", "wb") as out_f:
@@ -477,7 +556,7 @@ def _upload_bundle(session: str, zip_path: Path) -> None:
         os.remove("/content/bundle.zip")
         print("UNPACKED:", sorted(os.listdir("/content/bundle/blender")), flush=True)
     """).strip()
-    _exec_script(session, unpack_code, timeout=300)
+    _exec_script(session, unpack_code, timeout=120, telemetry=telemetry, retries=3, label="bundle-unpack")
 
 
 def _download_one_file(session: str, remote_path: str, local_dst: Path, *, delete_remote: bool = True) -> bool:
@@ -573,6 +652,10 @@ def _run_remote_job(
 
     total_frames = f1 - f0 + 1
     done_so_far = total_frames - len(missing)
+    idle_limit = 900.0  # 15 min without any output -> kill hung colab websocket instead of burning CU forever
+    last_activity = {"t": time.monotonic()}
+    stop_watch = threading.Event()
+    hung = {"flag": False}
 
     try:
         proc = subprocess.Popen(
@@ -586,8 +669,24 @@ def _run_remote_job(
             bufsize=1,
             creationflags=CREATION_FLAGS,
         )
+
+        def _idle_watchdog() -> None:
+            while not stop_watch.wait(15.0):
+                if time.monotonic() - last_activity["t"] > idle_limit:
+                    hung["flag"] = True
+                    msg = f"[warn] No render output for {int(idle_limit)}s — killing hung colab exec PID {proc.pid}"
+                    if telemetry:
+                        telemetry.log(msg)
+                    else:
+                        print(msg, flush=True)
+                    _kill_proc_tree(proc.pid)
+                    return
+
+        wt = threading.Thread(target=_idle_watchdog, daemon=True)
+        wt.start()
         assert proc.stdout is not None
         for line in proc.stdout:
+            last_activity["t"] = time.monotonic()
             s = line.rstrip()
             if telemetry:
                 telemetry.log(s)
@@ -618,8 +717,12 @@ def _run_remote_job(
                         telemetry.record_frame(m.group(1), float(m.group(2)), done_so_far, primary_local)
                     except ValueError:
                         pass
+        stop_watch.set()
         rc = proc.wait()
+        if hung["flag"] and rc == 0:
+            rc = 124
     finally:
+        stop_watch.set()
         for fut in futures:
             try:
                 fut.result()
@@ -734,8 +837,7 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
             telemetry.update(status="provisioning")
             telemetry.log(f"[colab] Provisioning session '{args.session}' (gpu={args.gpu.upper()})...")
             created_session = _ensure_session(args.session, args.gpu, args.high_mem)
-            telemetry.log(f"[colab] Ensuring Blender {blender_ver} on '{args.session}'...")
-            _ensure_remote_blender(args.session, blender_ver)
+            _ensure_remote_blender(args.session, blender_ver, telemetry=telemetry)
 
             for idx, (j, zip_path, shot_name, out_dir, prefix, f0, f1, samples, extras, fmt, missing) in enumerate(staged, 1):
                 assert zip_path is not None
@@ -750,7 +852,7 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
                     done_frames=total - len(missing),
                 )
                 telemetry.log(f"\n=== [{idx}/{len(staged)}] {j['name']} ({len(missing)} missing frame(s)) ===")
-                _upload_bundle(args.session, zip_path)
+                _upload_bundle(args.session, zip_path, telemetry=telemetry)
                 job_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", j["out"]).strip("_") or f"job_{idx}"
                 t0 = time.time()
                 telemetry.update(status="rendering")
