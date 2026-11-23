@@ -465,6 +465,7 @@ def _exec_script(
             )
             lines: list[str] = []
             timed_out = {"flag": False}
+            conn_lost = False
 
             def _watchdog() -> None:
                 timed_out["flag"] = True
@@ -481,14 +482,24 @@ def _exec_script(
                     lines.append(s)
                     if s:
                         log(s)
+                    if "RuntimeError: Connection was lost." in s or "WebSocketConnectionClosedException" in s:
+                        conn_lost = True
+                        log(f"[warn] {label} websocket dropped — killing hung colab PID {proc.pid} to retry immediately...")
+                        _kill_proc_tree(proc.pid)
+                        break
                 rc = proc.wait()
             finally:
                 timer.cancel()
 
-            if rc == 0 and not timed_out["flag"]:
+            if rc == 0 and not timed_out["flag"] and not conn_lost:
                 return
             tail = " | ".join(lines[-3:]) if lines else f"rc={rc}"
-            last_err = f"{label} timed out" if timed_out["flag"] else f"{label} failed (rc={rc}): {tail}"
+            if conn_lost:
+                last_err = f"{label} connection lost"
+            elif timed_out["flag"]:
+                last_err = f"{label} timed out"
+            else:
+                last_err = f"{label} failed (rc={rc}): {tail}"
             if attempt < retries:
                 log(f"[warn] {last_err} — retrying ({attempt}/{retries})...")
                 time.sleep(3 * attempt)
@@ -532,12 +543,29 @@ def _ensure_remote_blender(session: str, version: str, telemetry: Optional[_Rend
     _exec_script(session, setup_code, timeout=480, telemetry=telemetry, retries=3, label="blender-setup")
 
 
+def _upload_with_retry(
+    session: str, local_path: Path, remote_path: str, telemetry: Optional[_RenderTelemetry] = None, retries: int = 3
+) -> None:
+    log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        res = _run_colab(["upload", "-s", session, str(local_path), remote_path], check=False, capture=True)
+        if res.returncode == 0:
+            return
+        detail = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
+        last_err = detail.splitlines()[-1] if detail else f"rc={res.returncode}"
+        if attempt < retries:
+            log(f"[warn] Upload failed ({last_err}) — retrying ({attempt}/{retries})...")
+            time.sleep(3 * attempt)
+    raise RuntimeError(f"colab upload {local_path.name} failed: {last_err}")
+
+
 def _upload_bundle(session: str, zip_path: Path, telemetry: Optional[_RenderTelemetry] = None) -> None:
     log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
     total = zip_path.stat().st_size
     if total <= CHUNK_BYTES:
         log(f"[colab] Uploading {zip_path.name} ({total / 1e6:.2f} MB)...")
-        _run_colab(["upload", "-s", session, str(zip_path), "/content/bundle.zip"], check=True)
+        _upload_with_retry(session, zip_path, "/content/bundle.zip", telemetry=telemetry)
         log("[colab] Unpacking bundle on VM...")
         unpack_code = textwrap.dedent("""
             import os, shutil, zipfile
@@ -559,7 +587,7 @@ def _upload_bundle(session: str, zip_path: Path, telemetry: Optional[_RenderTele
                 chunk_file = Path(tmpdir) / f"part_{idx:03d}.bin"
                 chunk_file.write_bytes(src.read(CHUNK_BYTES))
                 remote = f"/content/bundle_part_{idx:03d}.bin"
-                _run_colab(["upload", "-s", session, str(chunk_file), remote], check=True)
+                _upload_with_retry(session, chunk_file, remote, telemetry=telemetry)
                 log(f"  uploaded chunk {idx + 1}/{n_chunks}")
 
     log("[colab] Reassembling and unpacking bundle on VM...")
@@ -714,6 +742,15 @@ def _run_remote_job(
                 telemetry.log(s)
             else:
                 print(s, flush=True)
+            if "RuntimeError: Connection was lost." in s or "WebSocketConnectionClosedException" in s:
+                hung["flag"] = True
+                msg = f"[warn] Colab websocket dropped during render — killing hung colab exec PID {proc.pid}"
+                if telemetry:
+                    telemetry.log(msg)
+                else:
+                    print(msg, flush=True)
+                _kill_proc_tree(proc.pid)
+                break
             m = FRAME_LINE_RE.search(s)
             if m:
                 done_so_far = min(total_frames, done_so_far + 1)
@@ -1330,22 +1367,40 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
                 job_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", j["out"]).strip("_") or f"job_{idx}"
                 t0 = time.time()
                 telemetry.update(status="rendering")
-                dl_count, rc = _run_remote_job(
-                    args.session,
-                    shot_name,
-                    job_slug,
-                    out_dir,
-                    prefix,
-                    f0,
-                    f1,
-                    samples,
-                    extras,
-                    missing,
-                    args.par,
-                    telemetry=telemetry,
-                    fmt=fmt,
-                )
-                rem = _missing_frames(out_dir, prefix, f0, f1, fmt)
+                dl_count = 0
+                rc = 0
+                cur_missing = list(missing)
+                for render_attempt in range(1, 4):
+                    dl_part, rc = _run_remote_job(
+                        args.session,
+                        shot_name,
+                        job_slug,
+                        out_dir,
+                        prefix,
+                        f0,
+                        f1,
+                        samples,
+                        extras,
+                        cur_missing,
+                        args.par,
+                        telemetry=telemetry,
+                        fmt=fmt,
+                    )
+                    dl_count += dl_part
+                    cur_missing = _missing_frames(out_dir, prefix, f0, f1, fmt)
+                    telemetry.update(done_frames=total - len(cur_missing))
+                    if not cur_missing:
+                        rc = 0
+                        break
+                    if render_attempt < 3 and _session_exists(args.session):
+                        telemetry.log(
+                            f"[warn] {j['name']}: {len(cur_missing)} frame(s) still missing after rc={rc} — "
+                            f"reconnecting to '{args.session}' (attempt {render_attempt + 1}/3)..."
+                        )
+                        time.sleep(5 * render_attempt)
+                    else:
+                        break
+                rem = cur_missing
                 telemetry.update(done_frames=total - len(rem))
                 telemetry.log(
                     f"[summary] {j['name']}: {total - len(rem)}/{total} present locally "

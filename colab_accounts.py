@@ -93,6 +93,15 @@ def _safe_slug(email: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", email.lower()).strip("_") or "account"
 
 
+def _mask_email(email: str) -> str:
+    """Return a privacy-masked display version of an email address."""
+    if not email or "@" not in email:
+        return "••••••" if email else ""
+    local, domain = email.split("@", 1)
+    prefix = local[:2] if len(local) >= 2 else local[:1]
+    return f"{prefix}•••••@{domain}"
+
+
 def _is_pid_alive(pid: int) -> bool:
     if not pid or pid <= 0:
         return False
@@ -714,6 +723,12 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         "jobs_by_id": {},
     }
     gui_procs: list[subprocess.Popen] = []
+    privacy_state = {"hide_emails": bool(_load_index().get("hide_emails", True))}
+
+    def fmt_email(email: Optional[str]) -> str:
+        if not email:
+            return ""
+        return _mask_email(email) if privacy_state["hide_emails"] else email
 
     # --- Subtle bottom status strip (packed first so nothing ever clips) ---
     status_var = tk.StringVar(value="")
@@ -1143,7 +1158,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             info = live_cache.get(active_email) or accounts.get(active_email, {})
             bal = info.get("balance")
             vms = info.get("assignments_count") or 0
-            lbl_top_account.configure(text=active_email, fg=TEXT)
+            lbl_top_account.configure(text=fmt_email(active_email), fg=TEXT)
             if bal is not None:
                 cu_color = GREEN if bal >= 10 else (AMBER if bal > 0 else RED)
                 lbl_top_cu.configure(text=f"{bal:.2f} CU", fg=cu_color)
@@ -1175,7 +1190,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                 vm_txt = str(meta.get("assignments_count", 0))
             else:
                 bal_txt, rate_txt, vm_txt = "-", "-", "-"
-            tree.insert("", "end", iid=email, values=(email, st_txt, bal_txt, rate_txt, vm_txt))
+            tree.insert("", "end", iid=email, values=(fmt_email(email), st_txt, bal_txt, rate_txt, vm_txt))
 
         if prev_sel and prev_sel in accounts:
             tree.selection_set(prev_sel)
@@ -1201,7 +1216,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                 sname = ep_map.get(ep, "Browser / external")
                 row_id = f"{email}::{ep}"
                 vm_row_map[row_id] = (email, ep)
-                vm_tree.insert("", "end", iid=row_id, values=(email, sname, a.get("accelerator", "?"), f"{rate_val:.2f}/hr"))
+                vm_tree.insert("", "end", iid=row_id, values=(fmt_email(email), sname, a.get("accelerator", "?"), f"{rate_val:.2f}/hr"))
                 total_running += 1
         if prev_vm_sel and prev_vm_sel in vm_row_map:
             vm_tree.selection_set(prev_vm_sel)
@@ -1428,19 +1443,19 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         idx = _load_index()
         old_active = idx.get("active")
         if old_active == target_email:
-            set_status(f"Already using {target_email}", MUTED)
+            set_status(f"Already using {fmt_email(target_email)}", MUTED)
             return
 
         old_vms = (live_cache.get(old_active) or idx.get("accounts", {}).get(old_active or "", {})).get("assignments_count", 0)
         if old_active and old_vms:
             ans = messagebox.askyesnocancel(
                 "Running VM",
-                f"{old_active} still has {old_vms} running VM(s).\nStop them before switching?",
+                f"{fmt_email(old_active)} still has {old_vms} running VM(s).\nStop them before switching?",
             )
             if ans is None:
                 return
             if ans is True:
-                set_status(f"Stopping VMs on {old_active}...", AMBER)
+                set_status(f"Stopping VMs on {fmt_email(old_active)}...", AMBER)
                 root.update_idletasks()
                 try:
                     stop_all_vms_for_account(old_active)
@@ -1451,7 +1466,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         try:
             switch_active_account(target_email)
             render_accounts_ui()
-            set_status(f"Switched to {target_email}", GREEN)
+            set_status(f"Switched to {fmt_email(target_email)}", GREEN)
             refresh_all(sync_first=False)
         except Exception as e:
             messagebox.showerror("Switch Failed", str(e))
@@ -1462,9 +1477,9 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         active_email = idx.get("active")
         if not active_email:
             return
-        if not messagebox.askyesno("Stop VMs", f"Stop all running Colab VMs on {active_email}?"):
+        if not messagebox.askyesno("Stop VMs", f"Stop all running Colab VMs on {fmt_email(active_email)}?"):
             return
-        set_status(f"Stopping VMs on {active_email}...", AMBER)
+        set_status(f"Stopping VMs on {fmt_email(active_email)}...", AMBER)
 
         def worker() -> None:
             try:
@@ -1489,12 +1504,12 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         if not sel:
             return
         email = sel[0]
-        if not messagebox.askyesno("Remove Account", f"Remove saved sign-in for {email}?"):
+        if not messagebox.askyesno("Remove Account", f"Remove saved sign-in for {fmt_email(email)}?"):
             return
         remove_saved_account(email)
         live_cache.pop(email, None)
         render_accounts_ui()
-        set_status(f"Removed {email}", MUTED)
+        set_status(f"Removed {fmt_email(email)}", MUTED)
 
     def do_clear_history() -> None:
         active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
@@ -1534,9 +1549,9 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         if not sel or sel[0] not in vm_row_map:
             return
         email, ep = vm_row_map[sel[0]]
-        if not messagebox.askyesno("Stop VM", f"Stop this VM on {email}?"):
+        if not messagebox.askyesno("Stop VM", f"Stop this VM on {fmt_email(email)}?"):
             return
-        set_status(f"Stopping VM on {email}...", AMBER)
+        set_status(f"Stopping VM on {fmt_email(email)}...", AMBER)
 
         def worker() -> None:
             try:
@@ -1551,7 +1566,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                 messagebox.showerror("Stop VM Failed", err)
                 set_status(err, RED)
             else:
-                set_status(f"Stopped VM on {email}", GREEN)
+                set_status(f"Stopped VM on {fmt_email(email)}", GREEN)
                 refresh_all(sync_first=False)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1790,7 +1805,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             def _on_ok(info: dict[str, Any]) -> None:
                 dlg.destroy()
                 render_accounts_ui()
-                set_status(f"Signed in as {info['email']} ({info['balance']:.2f} CU)", GREEN)
+                set_status(f"Signed in as {fmt_email(info['email'])} ({info['balance']:.2f} CU)", GREEN)
 
             def _on_err(err: str) -> None:
                 btn_connect.configure(state="normal", text="Sign In")
@@ -1804,6 +1819,26 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
         entry.bind("<Return>", lambda _e: submit_code())
 
     # --- Wire buttons ---
+    def do_toggle_privacy() -> None:
+        privacy_state["hide_emails"] = not privacy_state["hide_emails"]
+        try:
+            idx = _load_index()
+            idx["hide_emails"] = privacy_state["hide_emails"]
+            _save_index(idx)
+        except Exception:
+            pass
+        btn_privacy.configure(text="Show email" if privacy_state["hide_emails"] else "Hide email")
+        render_accounts_ui()
+
+    btn_privacy = make_btn(
+        tb_right,
+        "Show email" if privacy_state["hide_emails"] else "Hide email",
+        do_toggle_privacy,
+        bg=SURFACE,
+        hover=CONTROL,
+        fg=MUTED,
+    )
+    btn_privacy.pack(side="left", padx=(0, 8))
     make_btn(tb_right, "Refresh", lambda: refresh_all(sync_first=True)).pack(side="left", padx=(0, 8))
     make_btn(tb_right, "Buy units", lambda: webbrowser.open("https://colab.research.google.com/signup"), bg=SURFACE, hover=CONTROL, fg=MUTED).pack(side="left")
 
