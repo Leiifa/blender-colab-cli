@@ -31,10 +31,10 @@ python colab_accounts.py stop-vms
    ```bash
    python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4
    ```
-   - Auto-opens the Studio GUI on the **Live Monitor** tab (single-instance, detached; disable with `--no-gui` or `COLAB_NO_GUI=1`).
-   - Streams each completed frame straight to `<dir>` and deletes it from the VM.
-   - Resumable: existing non-empty frames in `<dir>` are skipped automatically.
-   - Auto-stops the Colab VM on completion or error unless `--keep` is passed.
+   - **Detaches by default:** validates paths, spawns a background worker, auto-opens the **Live Monitor** GUI (disable with `--no-gui` or `COLAB_NO_GUI=1`), and exits `0` immediately.
+   - **Do NOT poll or monitor the render** after launching — report the launched job + output folder and hand off to the user.
+   - Pass `--wait` **only** when you genuinely need the rendered frames in the same turn (e.g., a 1-frame test check or an immediate post-render assembly step).
+   - Streams each completed frame straight to `<dir>`, skips existing frames on resume, and auto-stops the Colab VM on completion or error unless `--keep` is passed.
 3. For batch queues (`jobs.json`), use:
    ```bash
    python colab_render.py queue jobs.json --gpu L4

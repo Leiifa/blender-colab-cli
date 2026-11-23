@@ -989,7 +989,14 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     _entry(r3, samples_var, width=7).pack(side="left", ipady=5)
     tk.Label(r3, text="(0 = default)", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(6, 0))
 
-    def _segmented(parent, var: tk.StringVar, options: tuple[str, ...]) -> None:
+    def _segmented(
+        parent,
+        var: tk.StringVar,
+        options: tuple[str, ...],
+        *,
+        labels: Optional[dict[str, str]] = None,
+        on_change=None,
+    ) -> None:
         wrap = tk.Frame(parent, bg=BG)
         wrap.pack(side="left")
         btns: dict[str, tk.Button] = {}
@@ -1001,11 +1008,14 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                     b.configure(bg=ACCENT, fg=TEXT, activebackground=ACCENT_HOVER)
                 else:
                     b.configure(bg=CONTROL, fg=MUTED, activebackground=HOVER)
+            if on_change is not None:
+                on_change()
 
         for val in options:
             b = tk.Button(
                 wrap,
-                text=val,
+                text=(labels[val] if labels and val in labels else val),
+                justify="center",
                 command=lambda v=val: (var.set(v), _refresh_seg()),
                 relief="flat",
                 bd=0,
@@ -1018,10 +1028,37 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             btns[val] = b
         _refresh_seg()
 
+    # Approximate Google Colab Compute Unit rates per hour (1 CU ≈ $0.10).
+    # Actual rates can vary slightly by region, RAM tier, and Colab updates.
+    GPU_PRICING: dict[str, tuple[str, float, str]] = {
+        "L4": ("~1.94 CU/hr", 1.94, "NVIDIA L4 · 24 GB VRAM"),
+        "T4": ("~1.1 CU/hr", 1.10, "NVIDIA T4 · 16 GB VRAM"),
+        "A100": ("~6.8 CU/hr", 6.77, "NVIDIA A100 · 40–80 GB VRAM"),
+        "H100": ("~18.1 CU/hr", 18.05, "NVIDIA H100 · 80 GB VRAM (Pro+)"),
+        "CPU": ("~0.1 CU/hr", 0.10, "CPU only · no GPU"),
+    }
+    gpu_btn_labels = {k: f"{k}\n{v[0]}" for k, v in GPU_PRICING.items()}
+    gpu_cost_lbl = tk.Label(rf, text="", bg=SURFACE, fg=MUTED, font=("Segoe UI", 8), anchor="w")
+
+    def _update_gpu_cost_label() -> None:
+        g = gpu_var.get() or "L4"
+        rate_str, rate_val, desc = GPU_PRICING.get(g, ("?", 0.0, g))
+        usd_hr = rate_val * 0.10
+        idx = _load_index()
+        active_email = idx.get("active")
+        info = (live_cache.get(active_email) or idx.get("accounts", {}).get(active_email, {})) if active_email else {}
+        bal = info.get("balance")
+        est = ""
+        if isinstance(bal, (int, float)) and bal > 0 and rate_val > 0:
+            hrs = bal / rate_val
+            est = f" · ~{hrs:.1f}h on current balance" if hrs < 100 else f" · ~{int(hrs)}h on current balance"
+        gpu_cost_lbl.configure(text=f"{desc} · {rate_str} (~${usd_hr:.2f}/hr){est} · approx., set by Colab")
+
     r4 = _row("GPU")
-    _segmented(r4, gpu_var, ("L4", "T4", "A100", "H100", "CPU"))
+    _segmented(r4, gpu_var, ("L4", "T4", "A100", "H100", "CPU"), labels=gpu_btn_labels, on_change=_update_gpu_cost_label)
     tk.Label(r4, text="Workers", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
     _segmented(r4, par_var, ("1", "2", "3", "4"))
+    gpu_cost_lbl.pack(anchor="w", padx=(92, 0), pady=(0, 4))
 
     r4b = _row("Session")
     _entry(r4b, session_var, width=20).pack(side="left", ipady=5)
@@ -1157,6 +1194,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             fg=AMBER if total_running else MUTED,
         )
         btn_stop_one_vm.configure(state="normal" if total_running else "disabled")
+        _update_gpu_cost_label()
 
     def _on_job_selected(_event=None) -> None:
         sel = jobs_tree.selection()
@@ -1537,6 +1575,8 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             cmd.append("--keep")
         if dry_run:
             cmd.append("--dry-run")
+        else:
+            cmd.append("--wait")
 
         nb.select(tab_monitor)
         if dry_run:

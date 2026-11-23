@@ -63,9 +63,9 @@ JOBS_DIR = MONITOR_DIR / "jobs"
 class _RenderTelemetry:
     """Writes per-run live render progress & logs to ~/.config/colab-cli/jobs/ so the GUI monitors multiple concurrent CLI/agent/GUI runs."""
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(self, *, enabled: bool = True, run_id: Optional[str] = None) -> None:
         self.enabled = enabled
-        self.run_id = f"{int(time.time())}_{os.getpid()}"
+        self.run_id = run_id or f"{int(time.time())}_{os.getpid()}"
         self.json_path = JOBS_DIR / f"{self.run_id}.json"
         self.log_path = JOBS_DIR / f"{self.run_id}.log"
         self.state: dict = {
@@ -96,7 +96,8 @@ class _RenderTelemetry:
             JOBS_DIR.mkdir(parents=True, exist_ok=True)
             self._prune_old()
             try:
-                self.log_path.write_text("", encoding="utf-8")
+                if not self.log_path.exists():
+                    self.log_path.write_text("", encoding="utf-8")
             except OSError:
                 pass
             self._flush_json()
@@ -128,7 +129,11 @@ class _RenderTelemetry:
         self._flush_json()
 
     def log(self, line: str) -> None:
-        print(line, flush=True)
+        if sys.stdout is not None:
+            try:
+                print(line, flush=True)
+            except OSError:
+                pass
         if not self.enabled:
             return
         try:
@@ -773,6 +778,82 @@ def _maybe_open_monitor_gui(no_gui: bool) -> None:
         pass
 
 
+def _should_detach(args: argparse.Namespace) -> bool:
+    if getattr(args, "dry_run", False):
+        return False
+    if getattr(args, "wait", False) or getattr(args, "_run_id", None):
+        return False
+    if os.environ.get("COLAB_WAIT", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    return True
+
+
+def _spawn_detached_render(planned: list, args: argparse.Namespace) -> int:
+    """Spawn the render in a fully detached background process and exit immediately."""
+    run_id = f"{int(time.time())}_{os.getpid()}"
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = JOBS_DIR / f"{run_id}.json"
+    log_path = JOBS_DIR / f"{run_id}.log"
+
+    first_job, first_blend, first_out, _p, f0, f1, _s, _ex, _fmt, first_missing = planned[0]
+    total_missing = sum(len(item[9]) for item in planned)
+    job_names = ", ".join(item[0]["name"] for item in planned)
+
+    # Reconstruct child command with --wait, --no-gui (parent opens GUI once), and shared --_run-id
+    child_args = [a for a in sys.argv[1:] if a != "--detach"]
+    child_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *child_args,
+        "--wait",
+        "--no-gui",
+        "--_run-id",
+        run_id,
+    ]
+
+    kwargs: dict = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        env=_colab_env(),
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(child_cmd, **kwargs)
+
+    # Wait briefly for the worker to initialize its telemetry file (or catch immediate startup crashes)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise SystemExit(
+                f"ERROR: Detached render worker exited immediately (code {proc.returncode}). "
+                f"Re-run with --wait to see error output."
+            )
+        if json_path.is_file():
+            break
+        time.sleep(0.05)
+
+    _maybe_open_monitor_gui(getattr(args, "no_gui", False))
+
+    print(f"[detached] Render started in background (run_id={run_id}, pid={proc.pid}, gpu={args.gpu.upper()}, session={args.session})")
+    print(f"[detached] Jobs   : {job_names} ({total_missing} frame(s) queued)")
+    print(f"[detached] Output : {first_out}")
+    print(f"[detached] Log    : {log_path}")
+    print(f"[detached] Monitor: Colab Render GUI (VM auto-stops when done)")
+    print(
+        "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
+        "the finished frames (pass --wait to block)."
+    )
+    return 0
+
+
 def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
     project_root = Path(args.project_root).resolve() if args.project_root else Path.cwd().resolve()
     out_root = Path(args.out_root).resolve() if args.out_root else project_root
@@ -798,10 +879,16 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
         print("[done] All requested frames already exist locally. No Colab VM allocated.")
         return 0
 
+    # Fail fast before detaching if local prerequisites are missing
+    _find_colab()
     blender_exe = None if args.skip_prepare else _find_blender(args.blender)
+
+    if _should_detach(args):
+        return _spawn_detached_render(planned, args)
+
     blender_ver = _detect_blender_version(args.blender_version, blender_exe)
 
-    telemetry = _RenderTelemetry(enabled=not args.dry_run)
+    telemetry = _RenderTelemetry(enabled=not args.dry_run, run_id=getattr(args, "_run_id", None))
     telemetry.update(
         status="preparing",
         job_count=len(planned),
@@ -986,6 +1073,13 @@ def _add_render_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--stop-existing", action="store_true", help="Also stop the session even if it already existed before this run")
     p.add_argument("--skip-prepare", action="store_true", help="Upload the .blend directly without running prepare_shot.py")
     p.add_argument("--dry-run", action="store_true", help="Check assets and missing frames without allocating a VM")
+    p.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait in the foreground until rendering finishes (default: detach immediately to background & Live Monitor GUI)",
+    )
+    p.add_argument("--detach", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--_run-id", dest="_run_id", default=None, help=argparse.SUPPRESS)
     p.add_argument("--no-gui", action="store_true", help="Do not auto-open the Live Monitor GUI when rendering starts")
 
 

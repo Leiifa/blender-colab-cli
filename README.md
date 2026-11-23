@@ -72,10 +72,10 @@ python colab_accounts.py switch second-account@gmail.com
 # Dry-run first (checks assets & missing frames, no VM allocated)
 python colab_render.py shot path/to/scene.blend --out renders/my_shot --f0 1 --f1 120 --samples 64 --dry-run
 
-# Single test frame on an L4 GPU (auto-stops VM when done)
-python colab_render.py shot path/to/scene.blend --out renders/test --f0 1 --f1 1 --samples 32 --gpu L4
+# Single test frame on an L4 GPU (pass --wait to block until the test frame finishes)
+python colab_render.py shot path/to/scene.blend --out renders/test --f0 1 --f1 1 --samples 32 --gpu L4 --wait
 
-# Full animation sequence with 3 parallel Blender workers
+# Full animation sequence with 3 parallel Blender workers (detaches immediately & opens Live Monitor GUI)
 python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 120 --samples 64 --gpu L4 --par 3
 
 # Keep VM alive across multiple renders, then stop manually
@@ -131,6 +131,7 @@ Safety guardrails built into the runbooks ensure agents always `--dry-run` Blend
 - `--keep` — keep VM running after completion (stop later with `colab_render.py stop`)
 - `--skip-prepare` — upload `.blend` as-is without running `prepare_shot.py`
 - `--dry-run` — check assets & missing frames without allocating a VM
+- `--wait` — block in the foreground until rendering finishes (default: detach immediately to background worker + Live Monitor GUI; set `COLAB_WAIT=1` to always block)
 - `--no-gui` — suppress auto-opening the **Live Monitor** GUI when a render starts (or set `COLAB_NO_GUI=1`)
 - `--extra KEY=VAL` (repeatable) — passed to `cloud_render.py`:
   - `engine=cycles|eevee` — override the `.blend`'s render engine
