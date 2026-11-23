@@ -1433,7 +1433,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     qpath = Path(args.jobs_json)
     if not qpath.is_file():
         raise SystemExit(f"ERROR: Jobs file not found: {args.jobs_json}")
-    jobs = json.loads(qpath.read_text(encoding="utf-8"))
+    jobs = json.loads(qpath.read_text(encoding="utf-8-sig"))
     if args.only:
         needle = args.only.lower()
         jobs = [j for j in jobs if needle in j.get("name", "").lower() or needle in j.get("blend", "").lower()]
