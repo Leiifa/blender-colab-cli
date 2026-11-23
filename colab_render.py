@@ -58,6 +58,8 @@ CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" e
 
 MONITOR_DIR = Path.home() / ".config" / "colab-cli"
 JOBS_DIR = MONITOR_DIR / "jobs"
+INBOX_DIR = MONITOR_DIR / "inbox"
+GUI_HEARTBEAT_PATH = MONITOR_DIR / "gui_heartbeat.json"
 
 
 class _RenderTelemetry:
@@ -955,14 +957,85 @@ def _build_shard_commands(planned: list, args: argparse.Namespace) -> list[dict]
     return shards
 
 
+def _submit_via_gui_inbox(job_specs: list[tuple[str, list[str]]]) -> Optional[dict[str, int]]:
+    """Hand off detached render launch(es) to the running Colab Render desktop GUI.
+
+    When an AI agent runs a command on Windows, the agent's shell Job Object kills direct
+    child processes as soon as the command exits. Submitting through the user's running
+    Colab Render desktop app spawns workers in the desktop session so they survive shell exit.
+    """
+    try:
+        if not GUI_HEARTBEAT_PATH.is_file():
+            return None
+        hb = json.loads(GUI_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        if not hb.get("inbox"):
+            return None
+        if time.time() - float(hb.get("ts") or 0.0) > 6.0:
+            return None
+    except Exception:
+        return None
+
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    req_id = f"{int(time.time() * 1000)}_{os.getpid()}"
+    req_path = INBOX_DIR / f"{req_id}.req.json"
+    ack_path = INBOX_DIR / f"{req_id}.ack.json"
+    payload = {
+        "req_id": req_id,
+        "cwd": os.getcwd(),
+        "jobs": [{"run_id": rid, "cmd": cmd} for rid, cmd in job_specs],
+    }
+    try:
+        tmp = req_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, req_path)
+    except OSError:
+        return None
+
+    wait_sec = 4.0 + 0.6 * max(0, len(job_specs) - 1)
+    deadline = time.monotonic() + wait_sec
+    while time.monotonic() < deadline:
+        if ack_path.is_file():
+            try:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+                ack_path.unlink(missing_ok=True)
+                if ack.get("ok") and isinstance(ack.get("pids"), dict):
+                    return {str(k): int(v) for k, v in ack["pids"].items()}
+            except Exception:
+                pass
+            return None
+        time.sleep(0.08)
+
+    req_path.unlink(missing_ok=True)
+    return None
+
+
 def _run_multi_vm(planned: list, args: argparse.Namespace) -> int:
     """Launch N parallel Colab VMs, each rendering a disjoint slice of missing frames."""
     shards = _build_shard_commands(planned, args)
     detach = _should_detach(args)
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
-    _maybe_open_monitor_gui(getattr(args, "no_gui", False))
 
     if detach:
+        inbox_pids = _submit_via_gui_inbox([(s["run_id"], s["cmd"]) for s in shards])
+        if inbox_pids is not None:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if all((JOBS_DIR / f"{s['run_id']}.json").is_file() for s in shards):
+                    break
+                time.sleep(0.05)
+            print(f"[detached via Colab Render GUI] Started {len(shards)} parallel Colab {args.gpu.upper()} VM shard(s):")
+            for s in shards:
+                pid = inbox_pids.get(s["run_id"], 0)
+                print(f"  [{s['idx']}/{len(shards)}] {s['name']} | session={s['session']} | {s['frames_desc']} | pid={pid} | run_id={s['run_id']}")
+            print(f"[detached] Output : {shards[0]['out_dir']}")
+            print(f"[detached] Monitor: Colab Render GUI (each VM auto-stops when its shard finishes)")
+            print(
+                "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
+                "the finished frames (pass --wait to block)."
+            )
+            return 0
+
+        _maybe_open_monitor_gui(getattr(args, "no_gui", False))
         kwargs: dict = dict(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -1001,11 +1074,18 @@ def _run_multi_vm(planned: list, args: argparse.Namespace) -> int:
             print(f"  [{s['idx']}/{len(launched)}] {s['name']} | session={s['session']} | {s['frames_desc']} | {st} | run_id={s['run_id']}")
         print(f"[detached] Output : {shards[0]['out_dir']}")
         print(f"[detached] Monitor: Colab Render GUI (each VM auto-stops when its shard finishes)")
+        if os.name == "nt":
+            print(
+                "[note] Colab Render GUI inbox was not active — launched directly. If running inside an AI agent "
+                "shell on Windows, keep Colab_Accounts.bat open so detached renders survive shell exit."
+            )
         print(
             "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
             "the finished frames (pass --wait to block)."
         )
         return 1 if bad else 0
+
+    _maybe_open_monitor_gui(getattr(args, "no_gui", False))
 
     # Blocking --wait mode: run all shards concurrently and stream prefixed logs
     procs: list[tuple[dict, subprocess.Popen]] = []
@@ -1084,6 +1164,25 @@ def _spawn_detached_render(planned: list, args: argparse.Namespace) -> int:
         run_id,
     ]
 
+    inbox_pids = _submit_via_gui_inbox([(run_id, child_cmd)])
+    if inbox_pids is not None:
+        pid = inbox_pids.get(run_id, 0)
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            if json_path.is_file():
+                break
+            time.sleep(0.05)
+        print(f"[detached via Colab Render GUI] Render started (run_id={run_id}, pid={pid}, gpu={args.gpu.upper()}, session={args.session})")
+        print(f"[detached] Jobs   : {job_names} ({total_missing} frame(s) queued)")
+        print(f"[detached] Output : {first_out}")
+        print(f"[detached] Log    : {log_path}")
+        print(f"[detached] Monitor: Colab Render GUI (VM auto-stops when done)")
+        print(
+            "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
+            "the finished frames (pass --wait to block)."
+        )
+        return 0
+
     kwargs: dict = dict(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -1120,6 +1219,11 @@ def _spawn_detached_render(planned: list, args: argparse.Namespace) -> int:
     print(f"[detached] Output : {first_out}")
     print(f"[detached] Log    : {log_path}")
     print(f"[detached] Monitor: Colab Render GUI (VM auto-stops when done)")
+    if os.name == "nt":
+        print(
+            "[note] Colab Render GUI inbox was not active — launched directly. If running inside an AI agent "
+            "shell on Windows, keep Colab_Accounts.bat open so detached renders survive shell exit."
+        )
     print(
         "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
         "the finished frames (pass --wait to block)."

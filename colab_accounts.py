@@ -81,7 +81,9 @@ ACCOUNTS_INDEX_PATH = CONFIG_DIR / "accounts.json"
 SESSIONS_PATH = CONFIG_DIR / "sessions.json"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 JOBS_DIR = CONFIG_DIR / "jobs"
+INBOX_DIR = CONFIG_DIR / "inbox"
 GUI_PID_PATH = CONFIG_DIR / "gui.pid"
+GUI_HEARTBEAT_PATH = CONFIG_DIR / "gui_heartbeat.json"
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1229,9 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
             active_states = {"starting", "preparing", "provisioning", "uploading", "rendering"}
             job_entries: list[tuple[str, dict[str, Any], Path]] = []
             if JOBS_DIR.is_dir():
-                for jp in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+                for jp in sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:25]:
+                    if jp.name.endswith("_queue.json"):
+                        continue
                     try:
                         d = json.loads(jp.read_text(encoding="utf-8"))
                         rid = str(d.get("run_id") or jp.stem)
@@ -1835,6 +1839,129 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                 GUI_PID_PATH.unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            if GUI_HEARTBEAT_PATH.is_file():
+                hb = json.loads(GUI_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+                if int(hb.get("pid") or 0) == os.getpid():
+                    GUI_HEARTBEAT_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    hb_last = {"t": 0.0}
+
+    def _write_heartbeat() -> None:
+        now = time.time()
+        if now - hb_last["t"] < 1.5:
+            return
+        hb_last["t"] = now
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = GUI_HEARTBEAT_PATH.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"pid": os.getpid(), "ts": now, "inbox": True}),
+                encoding="utf-8",
+            )
+            os.replace(tmp, GUI_HEARTBEAT_PATH)
+        except OSError:
+            pass
+
+    def _spawn_inbox_request(req: dict[str, Any], ack_path: Path) -> None:
+        jobs = req.get("jobs") or []
+        cwd = req.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        local_bin = str(Path.home() / ".local" / "bin")
+        if local_bin not in env.get("PATH", ""):
+            env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
+
+        pids: dict[str, int] = {}
+        err_msg = ""
+        try:
+            for idx, item in enumerate(jobs):
+                if idx > 0:
+                    time.sleep(0.5)
+                cmd = item.get("cmd") or []
+                rid = str(item.get("run_id") or f"job_{idx}")
+                if not cmd:
+                    continue
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    env=env,
+                    creationflags=CREATION_FLAGS,
+                )
+                gui_procs.append(proc)
+                pids[rid] = proc.pid
+
+                def _reap(p: subprocess.Popen) -> None:
+                    try:
+                        p.wait()
+                    finally:
+                        if p in gui_procs:
+                            gui_procs.remove(p)
+                        try:
+                            root.after(0, lambda: refresh_all(sync_first=False))
+                        except Exception:
+                            pass
+
+                threading.Thread(target=_reap, args=(proc,), daemon=True).start()
+        except Exception as e:
+            err_msg = str(e)
+
+        try:
+            tmp = ack_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"ok": not err_msg, "pids": pids, "error": err_msg}),
+                encoding="utf-8",
+            )
+            os.replace(tmp, ack_path)
+        except OSError:
+            pass
+
+        def _ui_notify() -> None:
+            if err_msg:
+                set_status(f"Inbox launch error: {err_msg}", RED)
+            else:
+                set_status(f"Started {len(pids)} render job(s)", ACCENT)
+                log_state["selected_run_id"] = None
+                poll_render_monitor(reschedule=False)
+
+        try:
+            root.after(0, _ui_notify)
+        except Exception:
+            pass
+
+    def poll_inbox() -> None:
+        try:
+            _write_heartbeat()
+            if INBOX_DIR.is_dir():
+                for req_path in sorted(INBOX_DIR.glob("*.req.json")):
+                    try:
+                        raw = req_path.read_text(encoding="utf-8")
+                        req_path.unlink(missing_ok=True)
+                        req = json.loads(raw)
+                        req_id = str(req.get("req_id") or req_path.name.removesuffix(".req.json"))
+                        ack_path = INBOX_DIR / f"{req_id}.ack.json"
+                        threading.Thread(
+                            target=_spawn_inbox_request, args=(req, ack_path), daemon=True
+                        ).start()
+                    except Exception:
+                        try:
+                            req_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        finally:
+            try:
+                root.after(400, poll_inbox)
+            except Exception:
+                pass
 
     def _on_close() -> None:
         _cleanup_pid()
@@ -1843,7 +1970,9 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     root.protocol("WM_DELETE_WINDOW", _on_close)
 
     render_accounts_ui()
+    _write_heartbeat()
     root.after(120, lambda: refresh_all(sync_first=True))
+    root.after(200, poll_inbox)
     root.after(250, poll_render_monitor)
     root.after(15000, schedule_auto_refresh)
     try:

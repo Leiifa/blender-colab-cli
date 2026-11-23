@@ -35,7 +35,7 @@ python colab_accounts.py stop-vms
    # Multi-VM parallel sharding for heavy/long sequences (splits missing frames across N VMs, same total CU cost)
    python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4 --vms 2
    ```
-   - **Detaches by default:** validates paths, spawns background worker(s), auto-opens the **Live Monitor** GUI (disable with `--no-gui` or `COLAB_NO_GUI=1`), and exits `0` immediately.
+   - **Detaches by default:** validates paths, hands off to the running **Colab Render** desktop app (`~/.config/colab-cli/inbox/` so renders survive Windows agent shell cleanup), or spawns directly if the GUI isn't open, and exits `0` immediately. If the CLI notes the GUI inbox wasn't active on Windows, ask the user to open `Colab_Accounts.bat`.
    - **Multi-VM sharding (`--vms N`):** splits missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1`..`<session>-N`), streaming into the same `<dir>` and auto-stopping each VM on finish. Standard Colab Pro accounts allow **up to 2 concurrent GPU VMs** (`--vms 2` on `L4` = `~3.88 CU/hr`, ~2× faster and cheaper than 1 `A100`).
    - **Do NOT poll or monitor the render** after launching — report the launched job + output folder and hand off to the user.
    - Pass `--wait` **only** when you genuinely need the rendered frames in the same turn (e.g., a 1-frame test check or an immediate post-render assembly step).

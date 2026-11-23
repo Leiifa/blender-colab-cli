@@ -59,7 +59,7 @@ python colab_accounts.py stop-vms
    # Heavy/long sequence: split missing frames across 2 parallel L4 VMs (~2x faster, same total CU cost)
    python colab_render.py shot path/to/scene.blend --out renders/shot --f0 1 --f1 192 --samples 48 --gpu L4 --vms 2
    ```
-   - `shot` and `queue` **detach immediately** and exit `0` after validating inputs, spawning the background worker(s), and opening the **Live Monitor** GUI (disable GUI with `--no-gui` or `COLAB_NO_GUI=1`).
+   - `shot` and `queue` **detach immediately** and exit `0` after validating inputs, handing the render off to the running **Colab Render** desktop app (`~/.config/colab-cli/inbox/` so renders survive Windows agent shell Job Object cleanup!), or spawning directly if the GUI isn't open. If the output prints `[note] Colab Render GUI inbox was not active`, tell the user to open `Colab_Accounts.bat` once so detached agent renders survive shell exit.
    - `--vms N` automatically partitions missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1` .. `<session>-N`), all streaming straight into `--out`, each auto-stopping its own VM when done. Standard Colab Pro accounts allow **up to 2 concurrent GPU VMs** (`--vms 2` on `L4` = `~3.88 CU/hr`, ~2× faster than 1 L4 and cheaper than 1 A100; `--vms 3` or `4` requires Pro+ or higher quota).
    - Frames stream directly into `--out` as each finishes, existing frames are skipped on resume, and each VM **auto-stops on completion, error, or 15-minute idle hang** (unless `--keep` is passed).
    - **Do NOT monitor, poll, `sleep`, or keep your turn running waiting for the render.** Report the launched shot, GPU/VM count, and output folder to the user and end your turn — the user tracks progress in the Live Monitor GUI.
