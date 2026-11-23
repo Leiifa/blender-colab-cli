@@ -778,6 +778,267 @@ def _maybe_open_monitor_gui(no_gui: bool) -> None:
         pass
 
 
+def _split_chunks(items: list[int], n: int) -> list[list[int]]:
+    """Split a sorted list into n non-empty contiguous chunks of nearly equal size."""
+    n = max(1, min(n, len(items)))
+    q, r = divmod(len(items), n)
+    chunks: list[list[int]] = []
+    start = 0
+    for i in range(n):
+        sz = q + (1 if i < r else 0)
+        chunks.append(items[start : start + sz])
+        start += sz
+    return chunks
+
+
+def _build_shard_commands(planned: list, args: argparse.Namespace) -> list[dict]:
+    """Build per-VM shard specs + child CLI commands when --vms > 1."""
+    total_missing = sum(len(item[9]) for item in planned)
+    n_vms = max(1, min(int(getattr(args, "vms", 1) or 1), total_missing))
+    base_ts = int(time.time())
+    parent_pid = os.getpid()
+    base_session = args.session
+    shards: list[dict] = []
+
+    if args.cmd == "shot" and len(planned) == 1:
+        j, blend_path, out_dir, prefix, _f0, _f1, samples, extras, _fmt, missing = planned[0]
+        chunks = _split_chunks(missing, n_vms)
+        clean_extras = [x for x in extras if not x.startswith("frames=")]
+        for idx, chunk in enumerate(chunks, 1):
+            run_id = f"{base_ts}_{parent_pid}_v{idx}"
+            sess = f"{base_session}-{idx}"
+            shard_name = f"{j['name']} [{idx}/{len(chunks)}]"
+            sf0, sf1 = chunk[0], chunk[-1]
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "shot",
+                str(blend_path),
+                "--out",
+                str(out_dir),
+                "--prefix",
+                prefix,
+                "--f0",
+                str(sf0),
+                "--f1",
+                str(sf1),
+                "--samples",
+                str(samples),
+                "--name",
+                shard_name,
+                "--gpu",
+                args.gpu,
+                "-s",
+                sess,
+                "--par",
+                str(args.par),
+                "--vms",
+                "1",
+                "--wait",
+                "--no-gui",
+                "--_run-id",
+                run_id,
+            ]
+            for ex in clean_extras:
+                cmd += ["--extra", ex]
+            if args.high_mem:
+                cmd.append("--high-mem")
+            if args.blender:
+                cmd += ["--blender", args.blender]
+            if args.blender_version:
+                cmd += ["--blender-version", args.blender_version]
+            if args.project_root:
+                cmd += ["--project-root", args.project_root]
+            if args.out_root:
+                cmd += ["--out-root", args.out_root]
+            if args.keep:
+                cmd.append("--keep")
+            if args.stop_existing:
+                cmd.append("--stop-existing")
+            if args.skip_prepare:
+                cmd.append("--skip-prepare")
+            shards.append(
+                {
+                    "idx": idx,
+                    "run_id": run_id,
+                    "session": sess,
+                    "name": shard_name,
+                    "frames_desc": f"{sf0}-{sf1} ({len(chunk)} frames)",
+                    "out_dir": str(out_dir),
+                    "cmd": cmd,
+                }
+            )
+        return shards
+
+    # Queue mode: shard every planned job's missing frames across n_vms buckets
+    per_vm_jobs: list[list[dict]] = [[] for _ in range(n_vms)]
+    for j, blend_path, out_dir, prefix, _f0, _f1, samples, extras, _fmt, missing in planned:
+        chunks = _split_chunks(missing, min(n_vms, len(missing)))
+        clean_extras = [x for x in extras if not x.startswith("frames=")]
+        for idx, chunk in enumerate(chunks):
+            per_vm_jobs[idx].append(
+                {
+                    "name": f"{j['name']} [{idx + 1}/{len(chunks)}]",
+                    "blend": str(blend_path),
+                    "out": str(out_dir),
+                    "prefix": prefix,
+                    "f0": chunk[0],
+                    "f1": chunk[-1],
+                    "samples": samples,
+                    "extra": clean_extras,
+                }
+            )
+
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    active_buckets = [b for b in per_vm_jobs if b]
+    for idx, bucket in enumerate(active_buckets, 1):
+        run_id = f"{base_ts}_{parent_pid}_v{idx}"
+        sess = f"{base_session}-{idx}"
+        shard_q = JOBS_DIR / f"{run_id}_queue.json"
+        shard_q.write_text(json.dumps(bucket, indent=2), encoding="utf-8")
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "queue",
+            str(shard_q),
+            "--gpu",
+            args.gpu,
+            "-s",
+            sess,
+            "--par",
+            str(args.par),
+            "--vms",
+            "1",
+            "--wait",
+            "--no-gui",
+            "--_run-id",
+            run_id,
+        ]
+        if args.high_mem:
+            cmd.append("--high-mem")
+        if args.blender:
+            cmd += ["--blender", args.blender]
+        if args.blender_version:
+            cmd += ["--blender-version", args.blender_version]
+        if args.project_root:
+            cmd += ["--project-root", args.project_root]
+        if args.out_root:
+            cmd += ["--out-root", args.out_root]
+        if args.keep:
+            cmd.append("--keep")
+        if args.stop_existing:
+            cmd.append("--stop-existing")
+        if args.skip_prepare:
+            cmd.append("--skip-prepare")
+        n_fr = sum(int(x["f1"]) - int(x["f0"]) + 1 for x in bucket)
+        shards.append(
+            {
+                "idx": idx,
+                "run_id": run_id,
+                "session": sess,
+                "name": ", ".join(x["name"] for x in bucket),
+                "frames_desc": f"{len(bucket)} job(s), ~{n_fr} frames",
+                "out_dir": bucket[0]["out"],
+                "cmd": cmd,
+            }
+        )
+    return shards
+
+
+def _run_multi_vm(planned: list, args: argparse.Namespace) -> int:
+    """Launch N parallel Colab VMs, each rendering a disjoint slice of missing frames."""
+    shards = _build_shard_commands(planned, args)
+    detach = _should_detach(args)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    _maybe_open_monitor_gui(getattr(args, "no_gui", False))
+
+    if detach:
+        kwargs: dict = dict(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env=_colab_env(),
+        )
+        if os.name == "nt":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+
+        launched: list[tuple[dict, subprocess.Popen]] = []
+        for s in shards:
+            proc = subprocess.Popen(s["cmd"], **kwargs)
+            launched.append((s, proc))
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if all((JOBS_DIR / f"{s['run_id']}.json").is_file() or p.poll() is not None for s, p in launched):
+                break
+            time.sleep(0.05)
+
+        print(f"[detached] Started {len(launched)} parallel Colab {args.gpu.upper()} VM shard(s):")
+        bad = 0
+        for s, proc in launched:
+            rc = proc.poll()
+            st = f"EXITED({rc})" if rc is not None else f"pid={proc.pid}"
+            if rc not in (None, 0):
+                bad += 1
+            print(f"  [{s['idx']}/{len(launched)}] {s['name']} | session={s['session']} | {s['frames_desc']} | {st} | run_id={s['run_id']}")
+        print(f"[detached] Output : {shards[0]['out_dir']}")
+        print(f"[detached] Monitor: Colab Render GUI (each VM auto-stops when its shard finishes)")
+        print(
+            "[detached] Handoff complete — do NOT poll or wait for completion unless a follow-up step needs "
+            "the finished frames (pass --wait to block)."
+        )
+        return 1 if bad else 0
+
+    # Blocking --wait mode: run all shards concurrently and stream prefixed logs
+    procs: list[tuple[dict, subprocess.Popen]] = []
+    threads: list[threading.Thread] = []
+    print_lock = threading.Lock()
+
+    def _pump(label: str, pipe) -> None:
+        for line in pipe:
+            with print_lock:
+                print(f"[{label}] {line.rstrip()}", flush=True)
+
+    try:
+        for s in shards:
+            p = subprocess.Popen(
+                s["cmd"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=_colab_env(),
+                creationflags=CREATION_FLAGS,
+            )
+            procs.append((s, p))
+            assert p.stdout is not None
+            t = threading.Thread(target=_pump, args=(s["session"], p.stdout), daemon=True)
+            t.start()
+            threads.append(t)
+
+        overall = 0
+        for _s, p in procs:
+            rc = p.wait()
+            if rc != 0:
+                overall = rc
+        for t in threads:
+            t.join(timeout=2.0)
+        return overall
+    except KeyboardInterrupt:
+        print("\n[colab] Stopping all parallel VM shards...", flush=True)
+        for _s, p in procs:
+            _kill_proc_tree(p.pid)
+        return 130
+
+
 def _should_detach(args: argparse.Namespace) -> bool:
     if getattr(args, "dry_run", False):
         return False
@@ -882,6 +1143,11 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
     # Fail fast before detaching if local prerequisites are missing
     _find_colab()
     blender_exe = None if args.skip_prepare else _find_blender(args.blender)
+
+    if not args.dry_run and int(getattr(args, "vms", 1) or 1) > 1:
+        total_missing = sum(len(item[9]) for item in planned)
+        if total_missing > 1:
+            return _run_multi_vm(planned, args)
 
     if _should_detach(args):
         return _spawn_detached_render(planned, args)
@@ -1064,7 +1330,13 @@ def _add_render_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gpu", default="L4", help="Colab GPU: T4, L4 (default), G4, A100, H100, or CPU")
     p.add_argument("--high-mem", action="store_true", help="Request high-RAM shape (non-L4 GPUs)")
     p.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Colab session name (default: {DEFAULT_SESSION})")
-    p.add_argument("--par", type=int, default=3, help="Parallel Blender processes on the GPU (default: 3)")
+    p.add_argument("--par", type=int, default=3, help="Parallel Blender processes per GPU VM (default: 3)")
+    p.add_argument(
+        "--vms",
+        type=int,
+        default=1,
+        help="Number of parallel Colab GPU VMs to shard missing frames across (default: 1)",
+    )
     p.add_argument("--blender", help="Path to local Blender binary (or set BLENDER_EXE)")
     p.add_argument("--blender-version", help="Linux Blender version to install on Colab (default: match local Blender)")
     p.add_argument("--project-root", help="Project root for resolving relative paths (default: current directory)")

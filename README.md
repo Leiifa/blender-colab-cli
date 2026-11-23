@@ -78,6 +78,9 @@ python colab_render.py shot path/to/scene.blend --out renders/test --f0 1 --f1 1
 # Full animation sequence with 3 parallel Blender workers (detaches immediately & opens Live Monitor GUI)
 python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 120 --samples 64 --gpu L4 --par 3
 
+# Multi-VM parallel sharding: split missing frames across 3 L4 VMs (~3x faster, same total CU cost)
+python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 192 --samples 64 --gpu L4 --vms 3
+
 # Keep VM alive across multiple renders, then stop manually
 python colab_render.py shot shot1.blend --out renders/shot1 --f0 1 --f1 24 --gpu L4 --keep
 python colab_render.py shot shot2.blend --out renders/shot2 --f0 1 --f1 24 --gpu L4 --keep
@@ -125,7 +128,8 @@ Safety guardrails built into the runbooks ensure agents always `--dry-run` Blend
 ### Useful `shot` / `queue` flags
 - `--gpu T4|L4|G4|A100|H100|CPU` — accelerator type (default: `L4`)
 - `--high-mem` — request High-RAM shape (for GPUs that support it)
-- `--par N` — parallel Blender processes per GPU (default: `3`)
+- `--par N` — parallel Blender processes per GPU VM (default: `3`)
+- `--vms N` — shard missing frames across `N` parallel Colab GPU VMs (default: `1`; each shard gets its own session `<session>-1..N` and auto-stops when done)
 - `--blender PATH` — path to local Blender binary (or set `BLENDER_EXE`)
 - `--blender-version X.Y.Z` — Linux Blender version to install on Colab (default: auto-detected from local Blender, fallback `5.2.2`)
 - `--keep` — keep VM running after completion (stop later with `colab_render.py stop`)

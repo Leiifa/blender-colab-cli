@@ -927,6 +927,7 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     f1_var = tk.StringVar(value="1")
     samples_var = tk.StringVar(value="0")
     gpu_var = tk.StringVar(value="L4")
+    vms_var = tk.StringVar(value="1")
     par_var = tk.StringVar(value="3")
     session_var = tk.StringVar(value="fetch-render")
     extras_var = tk.StringVar(value="")
@@ -1043,22 +1044,35 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
     def _update_gpu_cost_label() -> None:
         g = gpu_var.get() or "L4"
         rate_str, rate_val, desc = GPU_PRICING.get(g, ("?", 0.0, g))
-        usd_hr = rate_val * 0.10
+        try:
+            n_vms = max(1, int(vms_var.get() or "1"))
+        except ValueError:
+            n_vms = 1
+        total_rate = rate_val * n_vms
+        usd_hr = total_rate * 0.10
         idx = _load_index()
         active_email = idx.get("active")
         info = (live_cache.get(active_email) or idx.get("accounts", {}).get(active_email, {})) if active_email else {}
         bal = info.get("balance")
         est = ""
-        if isinstance(bal, (int, float)) and bal > 0 and rate_val > 0:
-            hrs = bal / rate_val
-            est = f" · ~{hrs:.1f}h on current balance" if hrs < 100 else f" · ~{int(hrs)}h on current balance"
-        gpu_cost_lbl.configure(text=f"{desc} · {rate_str} (~${usd_hr:.2f}/hr){est} · approx., set by Colab")
+        if isinstance(bal, (int, float)) and bal > 0 and total_rate > 0:
+            hrs = bal / total_rate
+            est = f" · ~{hrs:.1f}h on balance" if hrs < 100 else f" · ~{int(hrs)}h on balance"
+        rate_part = (
+            f"{n_vms} VMs × {rate_str} = ~{total_rate:.2f} CU/hr (~${usd_hr:.2f}/hr)"
+            if n_vms > 1
+            else f"{rate_str} (~${usd_hr:.2f}/hr)"
+        )
+        gpu_cost_lbl.configure(text=f"{desc} · {rate_part}{est} · approx., set by Colab")
 
     r4 = _row("GPU")
     _segmented(r4, gpu_var, ("L4", "T4", "A100", "H100", "CPU"), labels=gpu_btn_labels, on_change=_update_gpu_cost_label)
-    tk.Label(r4, text="Workers", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
-    _segmented(r4, par_var, ("1", "2", "3", "4"))
     gpu_cost_lbl.pack(anchor="w", padx=(92, 0), pady=(0, 4))
+
+    r4_par = _row("Parallel VMs")
+    _segmented(r4_par, vms_var, ("1", "2", "3", "4"), on_change=_update_gpu_cost_label)
+    tk.Label(r4_par, text="Workers / VM", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(22, 8))
+    _segmented(r4_par, par_var, ("1", "2", "3", "4"))
 
     r4b = _row("Session")
     _entry(r4b, session_var, width=20).pack(side="left", ipady=5)
@@ -1570,7 +1584,16 @@ def launch_gui(*, initial_tab: str = "monitor") -> int:
                     cmd += ["--extra", tok]
 
         sess_name = session_var.get().strip() or "fetch-render"
-        cmd += ["--gpu", gpu_var.get() or "L4", "--par", par_var.get() or "3", "-s", sess_name]
+        cmd += [
+            "--gpu",
+            gpu_var.get() or "L4",
+            "--vms",
+            vms_var.get() or "1",
+            "--par",
+            par_var.get() or "3",
+            "-s",
+            sess_name,
+        ]
         if keep_var.get():
             cmd.append("--keep")
         if dry_run:
