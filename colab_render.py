@@ -386,18 +386,28 @@ def _session_exists(session: str) -> bool:
     return True
 
 
-def _ensure_session(session: str, gpu: str, high_mem: bool) -> bool:
+def _ensure_session(
+    session: str, gpu: str, high_mem: bool, telemetry: Optional[_RenderTelemetry] = None
+) -> bool:
     """Ensure Colab session exists. Returns True if we created a new VM."""
+    log = telemetry.log if telemetry else (lambda s: print(s, flush=True))
     if _session_exists(session):
-        print(f"[colab] Reusing existing session '{session}'")
+        log(f"[colab] Reusing existing session '{session}'")
         return False
     args = ["new", "-s", session]
     if gpu.upper() != "CPU":
         args += ["--gpu", gpu.upper()]
     if high_mem:
         args.append("--high-mem")
-    print(f"[colab] Provisioning session '{session}' (gpu={gpu.upper()}, high_mem={high_mem})...")
-    _run_colab(args, check=True)
+    res = _run_colab(args, check=False, capture=True)
+    for line in (res.stdout or "").splitlines() + (res.stderr or "").splitlines():
+        s = line.strip()
+        if s:
+            log(s)
+    if res.returncode != 0:
+        detail = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
+        last_line = detail.splitlines()[-1] if detail else f"exit code {res.returncode}"
+        raise RuntimeError(f"colab new -s {session} failed: {last_line}")
     return True
 
 
@@ -969,7 +979,9 @@ def _run_multi_vm(planned: list, args: argparse.Namespace) -> int:
             kwargs["start_new_session"] = True
 
         launched: list[tuple[dict, subprocess.Popen]] = []
-        for s in shards:
+        for idx, s in enumerate(shards):
+            if idx > 0:
+                time.sleep(0.5)
             proc = subprocess.Popen(s["cmd"], **kwargs)
             launched.append((s, proc))
 
@@ -1194,7 +1206,7 @@ def _execute_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
         try:
             telemetry.update(status="provisioning")
             telemetry.log(f"[colab] Provisioning session '{args.session}' (gpu={args.gpu.upper()})...")
-            created_session = _ensure_session(args.session, args.gpu, args.high_mem)
+            created_session = _ensure_session(args.session, args.gpu, args.high_mem, telemetry=telemetry)
             _ensure_remote_blender(args.session, blender_ver, telemetry=telemetry)
 
             for idx, (j, zip_path, shot_name, out_dir, prefix, f0, f1, samples, extras, fmt, missing) in enumerate(staged, 1):

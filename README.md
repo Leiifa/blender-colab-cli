@@ -78,8 +78,8 @@ python colab_render.py shot path/to/scene.blend --out renders/test --f0 1 --f1 1
 # Full animation sequence with 3 parallel Blender workers (detaches immediately & opens Live Monitor GUI)
 python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 120 --samples 64 --gpu L4 --par 3
 
-# Multi-VM parallel sharding: split missing frames across 3 L4 VMs (~3x faster, same total CU cost)
-python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 192 --samples 64 --gpu L4 --vms 3
+# Multi-VM parallel sharding: split missing frames across 2 L4 VMs (~2x faster, same total CU cost; Colab Pro allows up to 2 GPU VMs/account)
+python colab_render.py shot path/to/scene.blend --out renders/my_shot --prefix f_ --f0 1 --f1 192 --samples 64 --gpu L4 --vms 2
 
 # Keep VM alive across multiple renders, then stop manually
 python colab_render.py shot shot1.blend --out renders/shot1 --f0 1 --f1 24 --gpu L4 --keep

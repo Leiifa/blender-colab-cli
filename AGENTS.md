@@ -56,11 +56,11 @@ python colab_accounts.py stop-vms
    # Single L4 VM
    python colab_render.py shot path/to/scene.blend --out renders/shot --f0 1 --f1 120 --samples 48 --gpu L4
 
-   # Heavy/long sequence: split missing frames across 2–3 parallel L4 VMs (~2–3x faster, same total CU cost)
-   python colab_render.py shot path/to/scene.blend --out renders/shot --f0 1 --f1 192 --samples 48 --gpu L4 --vms 3
+   # Heavy/long sequence: split missing frames across 2 parallel L4 VMs (~2x faster, same total CU cost)
+   python colab_render.py shot path/to/scene.blend --out renders/shot --f0 1 --f1 192 --samples 48 --gpu L4 --vms 2
    ```
    - `shot` and `queue` **detach immediately** and exit `0` after validating inputs, spawning the background worker(s), and opening the **Live Monitor** GUI (disable GUI with `--no-gui` or `COLAB_NO_GUI=1`).
-   - `--vms N` automatically partitions missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1` .. `<session>-N`), all streaming straight into `--out`, each auto-stopping its own VM when done. For heavy Cycles sequences (e.g., 100+ frames or volumetrics), **2–3× L4 VMs (`~1.94 CU/hr` each) is both faster and cheaper than 1× A100 (`~6.8 CU/hr`)** (Colab Pro typically allows 2–3 concurrent GPU VMs per account).
+   - `--vms N` automatically partitions missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1` .. `<session>-N`), all streaming straight into `--out`, each auto-stopping its own VM when done. Standard Colab Pro accounts allow **up to 2 concurrent GPU VMs** (`--vms 2` on `L4` = `~3.88 CU/hr`, ~2× faster than 1 L4 and cheaper than 1 A100; `--vms 3` or `4` requires Pro+ or higher quota).
    - Frames stream directly into `--out` as each finishes, existing frames are skipped on resume, and each VM **auto-stops on completion, error, or 15-minute idle hang** (unless `--keep` is passed).
    - **Do NOT monitor, poll, `sleep`, or keep your turn running waiting for the render.** Report the launched shot, GPU/VM count, and output folder to the user and end your turn — the user tracks progress in the Live Monitor GUI.
 4. **Only pass `--wait` when this turn actually needs the finished frames** (for example, a 1-frame lookdev test you must inspect immediately, or a follow-up assembly step the user explicitly asked you to run right after):

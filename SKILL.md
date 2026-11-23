@@ -33,10 +33,10 @@ python colab_accounts.py stop-vms
    python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4
 
    # Multi-VM parallel sharding for heavy/long sequences (splits missing frames across N VMs, same total CU cost)
-   python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4 --vms 3
+   python colab_render.py shot <scene.blend> --out <dir> --f0 <start> --f1 <end> --samples <N> --gpu L4 --vms 2
    ```
    - **Detaches by default:** validates paths, spawns background worker(s), auto-opens the **Live Monitor** GUI (disable with `--no-gui` or `COLAB_NO_GUI=1`), and exits `0` immediately.
-   - **Multi-VM sharding (`--vms N`):** splits missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1`..`<session>-N`), streaming into the same `<dir>` and auto-stopping each VM on finish. Prefer `--vms 2` or `--vms 3` on `L4` (`~1.94 CU/hr` each) for heavy 100+ frame shots — faster and cheaper than a single `A100`.
+   - **Multi-VM sharding (`--vms N`):** splits missing frames into `N` disjoint slices across `N` Colab VMs (`<session>-1`..`<session>-N`), streaming into the same `<dir>` and auto-stopping each VM on finish. Standard Colab Pro accounts allow **up to 2 concurrent GPU VMs** (`--vms 2` on `L4` = `~3.88 CU/hr`, ~2× faster and cheaper than 1 `A100`).
    - **Do NOT poll or monitor the render** after launching — report the launched job + output folder and hand off to the user.
    - Pass `--wait` **only** when you genuinely need the rendered frames in the same turn (e.g., a 1-frame test check or an immediate post-render assembly step).
    - Streams each completed frame straight to `<dir>`, skips existing frames on resume, and auto-stops each Colab VM on completion or error unless `--keep` is passed.
